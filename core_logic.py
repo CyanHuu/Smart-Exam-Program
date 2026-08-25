@@ -158,6 +158,40 @@ def assign_proctors(classroom_data, teacher_df, weights=None, random_seed=None, 
     return (assignments, report) if return_report else assignments
 
 
+def build_backup_assignments(classroom_data, teachers, assignments, weights=None, backup_count=2):
+    """为每个考场预留不在任何考场中的备选教师，避免同一时间冲突。"""
+    rooms = _room_records(classroom_data)
+    weights = _normalise_weights(weights)
+    used_ids = {
+        teacher[0]
+        for room_teachers in assignments.values()
+        for teacher in room_teachers
+    }
+    available = {
+        teacher[0]: teacher
+        for teacher in teachers
+        if teacher[0] not in used_ids
+    }
+    backups = {room: [] for room, _ in rooms}
+    for room, _ in rooms:
+        current = assignments.get(room, [])
+        for _ in range(max(0, int(backup_count))):
+            if not available:
+                break
+            best_score = max(
+                _score_teacher(teacher, current, weights)
+                for teacher in available.values()
+            )
+            candidates = [
+                teacher for teacher in available.values()
+                if _score_teacher(teacher, current, weights) == best_score
+            ]
+            selected = candidates[0]
+            backups[room].append(selected)
+            del available[selected[0]]
+    return backups
+
+
 def _build_report(rooms, assignments, teachers, available, warnings):
     total_needed = sum(needed for _, needed in rooms)
     total_assigned = sum(len(room_teachers) for room_teachers in assignments.values())

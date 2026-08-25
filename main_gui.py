@@ -8,14 +8,19 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QTextEdit, QHeaderView, QSplitter, QComboBox,
-    QInputDialog
+    QInputDialog, QDialog
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMutex
 from PyQt5.QtGui import QBrush, QColor, QFont, QTextCursor
 
 # 导入核心逻辑
 sys.path.append(str(Path(__file__).parent))
-from core_logic import assign_proctors, preference_weights, _teacher_records
+from core_logic import (
+    assign_proctors,
+    build_backup_assignments,
+    preference_weights,
+    _teacher_records,
+)
 from classroom_2 import get_classroom_info
 from examiner import analyze_teacher_list
 from outputTask import write_assignments_to_excel, split_excel_by_room_groups
@@ -65,6 +70,9 @@ class ArrangementWorker:
             assignments, self.report = assign_proctors(
                 classroom_data, teacher_df, weights=self.weights, return_report=True
             )
+            self.backup_assignments = build_backup_assignments(
+                classroom_data, self.teacher_pool, assignments, self.weights, backup_count=2
+            )
             self.signals.finished.emit(assignments, "")
         except Exception as e:
             import traceback
@@ -113,6 +121,7 @@ class ProctorArrangerApp(QMainWindow):
         self.assignments = None
         self.teacher_pool = []
         self.room_requirements = {}
+        self.backup_assignments = {}
         self.table_row_records = []
         self.selected_room = ""
         self.selected_result_row = -1
@@ -169,9 +178,9 @@ class ProctorArrangerApp(QMainWindow):
 
         # 表格
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(7)
+        self.result_table.setColumnCount(8)
         self.result_table.setHorizontalHeaderLabels([
-            "教室编号", "姓名", "工号", "部门", "性别", "经验", "角色"
+            "教室编号", "姓名", "工号", "部门", "性别", "经验", "角色", "备选监考"
         ])
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.result_table.cellClicked.connect(self.select_result_row)
@@ -216,15 +225,20 @@ class ProctorArrangerApp(QMainWindow):
         edit_layout = QHBoxLayout()
         self.btn_add_person = QPushButton("给选中考场增添人员")
         self.btn_delete_person = QPushButton("删除选中人员")
+        self.btn_replace_person = QPushButton("更换选中人员")
         self.btn_add_person.setStyleSheet(button_style)
         self.btn_delete_person.setStyleSheet(button_style)
+        self.btn_replace_person.setStyleSheet(button_style)
         self.btn_add_person.clicked.connect(self.add_person_to_room)
         self.btn_delete_person.clicked.connect(self.delete_person_from_room)
+        self.btn_replace_person.clicked.connect(self.replace_person_in_room)
         self.btn_add_person.setEnabled(False)
         self.btn_delete_person.setEnabled(False)
+        self.btn_replace_person.setEnabled(False)
         self.selected_room_label = QLabel("请先点击安排结果中的考场或教师")
         edit_layout.addWidget(self.btn_add_person)
         edit_layout.addWidget(self.btn_delete_person)
+        edit_layout.addWidget(self.btn_replace_person)
         edit_layout.addWidget(self.selected_room_label, 1)
 
         # 组装布局
@@ -260,6 +274,7 @@ class ProctorArrangerApp(QMainWindow):
         self.assignments = None
         self.teacher_pool = []
         self.room_requirements = {}
+        self.backup_assignments = {}
         self.table_row_records = []
         self.selected_room = ""
         self.selected_result_row = -1
@@ -267,6 +282,7 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_split.setEnabled(False)
         self.btn_add_person.setEnabled(False)
         self.btn_delete_person.setEnabled(False)
+        self.btn_replace_person.setEnabled(False)
         QApplication.processEvents()
 
         weights = preference_weights(self.preference_combo.currentData())
@@ -293,6 +309,7 @@ class ProctorArrangerApp(QMainWindow):
         self.report = getattr(self.worker, "report", {})
         self.teacher_pool = getattr(self.worker, "teacher_pool", [])
         self.room_requirements = dict(getattr(self.worker, "classroom_data", []))
+        self.backup_assignments = getattr(self.worker, "backup_assignments", {})
         self.status_label.setText("✅ 安排完成！")
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
         self.display_results_with_merge(assignments)
@@ -318,6 +335,27 @@ class ProctorArrangerApp(QMainWindow):
         )
         self.btn_add_person.setEnabled(True)
         self.btn_delete_person.setEnabled(teacher_index is not None)
+        self.btn_replace_person.setEnabled(teacher_index is not None)
+
+    def refresh_backups(self):
+        self.backup_assignments = build_backup_assignments(
+            list(self.room_requirements.items()),
+            self.teacher_pool,
+            self.assignments,
+            preference_weights(self.preference_combo.currentData()),
+            backup_count=2,
+        )
+
+    def choose_teacher(self, title, prompt, choices):
+        """使用较大的选择窗口，避免教师信息被省略号截断。"""
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setLabelText(prompt)
+        dialog.setComboBoxItems(choices)
+        dialog.setComboBoxEditable(False)
+        dialog.resize(760, 420)
+        ok = dialog.exec_() == QDialog.Accepted
+        return dialog.textValue(), ok
 
     def add_person_to_room(self):
         if not self.assignments or not self.selected_room:
@@ -329,9 +367,6 @@ class ProctorArrangerApp(QMainWindow):
             for teacher in room_teachers
         }
         available = [teacher for teacher in self.teacher_pool if teacher[0] not in assigned_ids]
-        if not available:
-            QMessageBox.information(self, "无法添加", "没有尚未安排的教师可供添加。")
-            return
         required = self.room_requirements.get(self.selected_room)
         current = self.assignments[self.selected_room]
         if required and len(current) >= required:
@@ -343,15 +378,107 @@ class ProctorArrangerApp(QMainWindow):
             )
             if answer != QMessageBox.Yes:
                 return
-        choices = [f"{teacher[1]}（{teacher[0]}）｜{teacher[4]}" for teacher in available]
-        choice, ok = QInputDialog.getItem(
-            self, "添加监考人员", f"选择要添加到 {self.selected_room} 的教师：", choices, 0, False
+
+        move_from_room = None
+        if available:
+            choices = [f"{teacher[1]}（{teacher[0]}）｜{teacher[4]}" for teacher in available]
+            candidates = available
+            dialog_title = "添加监考人员"
+            prompt = f"选择要添加到 {self.selected_room} 的教师："
+        else:
+            # 没有空闲教师时允许调动，保证教师仍然不会出现在两个考场。
+            movable = [
+                (room, teacher)
+                for room, room_teachers in self.assignments.items()
+                if room != self.selected_room
+                for teacher in room_teachers
+            ]
+            if not movable:
+                QMessageBox.information(self, "无法添加", "没有可添加或调入的教师。")
+                return
+            move_from_room = {teacher[0]: room for room, teacher in movable}
+            candidates = [teacher for _, teacher in movable]
+            choices = [
+                f"{teacher[1]}（{teacher[0]}）｜来源考场：{move_from_room[teacher[0]]}"
+                for teacher in candidates
+            ]
+            dialog_title = "从其他考场调入教师"
+            prompt = (
+                f"当前没有空闲教师。选择调入 {self.selected_room} 的教师：\n"
+                "调入后，原考场可能出现人员缺口。"
+            )
+        choice, ok = self.choose_teacher(dialog_title, prompt, choices)
+        if not ok:
+            return
+        selected = candidates[choices.index(choice)]
+        if move_from_room:
+            source_room = move_from_room[selected[0]]
+            self.assignments[source_room] = [
+                teacher for teacher in self.assignments[source_room]
+                if teacher[0] != selected[0]
+            ]
+        current.append(selected)
+        self.refresh_backups()
+        self.display_results_with_merge(self.assignments)
+        if move_from_room:
+            self.status_label.setText(f"✅ 已将 {selected[1]} 调入 {self.selected_room}")
+        else:
+            self.status_label.setText(f"✅ 已向 {self.selected_room} 添加 1 名监考教师")
+        self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
+
+    def replace_person_in_room(self):
+        if not self.assignments or not self.selected_room:
+            return
+        if self.selected_result_row < 0 or self.selected_result_row >= len(self.table_row_records):
+            return
+        room, teacher_index = self.table_row_records[self.selected_result_row]
+        if room != self.selected_room or teacher_index is None:
+            QMessageBox.information(self, "提示", "请点击要更换的教师所在行。")
+            return
+
+        target = self.assignments[room][teacher_index]
+        assigned_rooms = {
+            teacher[0]: other_room
+            for other_room, room_teachers in self.assignments.items()
+            for teacher in room_teachers
+        }
+        candidates = [
+            teacher for teacher in self.teacher_pool
+            if teacher[0] != target[0] and assigned_rooms.get(teacher[0]) != room
+        ]
+        if not candidates:
+            QMessageBox.information(self, "无法更换", "没有可用的替换教师。")
+            return
+        choices = []
+        for teacher in candidates:
+            source = assigned_rooms.get(teacher[0])
+            tag = f"当前安排：{source}（存在时间冲突）" if source else "空闲/备选教师"
+            choices.append(f"{teacher[1]}（{teacher[0]}）｜{tag}")
+        choice, ok = self.choose_teacher(
+            "更换监考人员", f"选择替换 {target[1]} 的教师：", choices
         )
         if not ok:
             return
-        current.append(available[choices.index(choice)])
+        replacement = candidates[choices.index(choice)]
+        source_room = assigned_rooms.get(replacement[0])
+        if source_room:
+            answer = QMessageBox.question(
+                self,
+                "发现时间冲突",
+                f"{replacement[1]} 已安排在 {source_room}。\n"
+                f"如果继续更换，将从 {source_room} 调出，原考场可能出现缺口。\n是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            self.assignments[source_room] = [
+                teacher for teacher in self.assignments[source_room]
+                if teacher[0] != replacement[0]
+            ]
+        self.assignments[room][teacher_index] = replacement
+        self.refresh_backups()
         self.display_results_with_merge(self.assignments)
-        self.status_label.setText(f"✅ 已向 {self.selected_room} 添加 1 名监考教师")
+        self.status_label.setText(f"✅ 已将 {target[1]} 更换为 {replacement[1]}")
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
 
     def delete_person_from_room(self):
@@ -373,6 +500,7 @@ class ProctorArrangerApp(QMainWindow):
         if answer != QMessageBox.Yes:
             return
         del self.assignments[room][teacher_index]
+        self.refresh_backups()
         self.display_results_with_merge(self.assignments)
         self.status_label.setText(f"✅ 已从 {room} 删除 1 名监考教师")
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
@@ -387,6 +515,7 @@ class ProctorArrangerApp(QMainWindow):
         if hasattr(self, "btn_add_person"):
             self.btn_add_person.setEnabled(False)
             self.btn_delete_person.setEnabled(False)
+            self.btn_replace_person.setEnabled(False)
             self.selected_room_label.setText("请先点击安排结果中的考场或教师")
         row = 0
         room_start_row = {}
@@ -419,7 +548,7 @@ class ProctorArrangerApp(QMainWindow):
                 self.result_table.setItem(row, 0, QTableWidgetItem(""))
                 self.result_table.setItem(row, 1, QTableWidgetItem(f"缺少 {missing} 名监考教师"))
                 self.result_table.setItem(row, 6, QTableWidgetItem("待补充"))
-                for column in range(7):
+                for column in range(8):
                     item = self.result_table.item(row, column)
                     if item is None:
                         item = QTableWidgetItem("")
@@ -435,7 +564,7 @@ class ProctorArrangerApp(QMainWindow):
                 self.result_table.setItem(row, 0, QTableWidgetItem(""))
                 self.result_table.setItem(row, 1, QTableWidgetItem("暂无监考人员"))
                 self.result_table.setItem(row, 6, QTableWidgetItem("待补充"))
-                for column in range(7):
+                for column in range(8):
                     item = self.result_table.item(row, column)
                     if item is None:
                         item = QTableWidgetItem("")
@@ -456,6 +585,13 @@ class ProctorArrangerApp(QMainWindow):
                 end_row += 1
             if end_row > start_row:
                 self.result_table.setSpan(start_row, 0, end_row - start_row + 1, 1)
+            backup_names = self.backup_assignments.get(room, [])
+            backup_text = "、".join(teacher[1] for teacher in backup_names) or "暂无"
+            self.result_table.setItem(
+                start_row, 7, QTableWidgetItem(backup_text)
+            )
+            if end_row > start_row:
+                self.result_table.setSpan(start_row, 7, end_row - start_row + 1, 1)
 
         # 让所有列根据内容自动调整宽度
         self.result_table.resizeColumnsToContents()
