@@ -7,6 +7,17 @@ import xlwt
 from xlutils.copy import copy
 
 
+def _save_workbook(workbook, path):
+    """把 Windows 文件占用错误转换成用户能看懂的提示。"""
+    try:
+        workbook.save(path)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"无法保存文件：{path}\n"
+            "该文件可能正在被 Excel/WPS 打开，请先关闭它，或换一个新的文件名后重试。"
+        ) from exc
+
+
 def _find_column(headers, keywords):
     # 关键词顺序代表业务优先级：先匹配实际教室编号，再匹配考试系统内部的考场号。
     for keyword in keywords:
@@ -31,7 +42,13 @@ def write_assignments_to_excel(assignments, input_output_path, header_row=2, out
     """
     target_path = output_path or input_output_path
     if output_path and output_path != input_output_path:
-        shutil.copyfile(input_output_path, output_path)
+        try:
+            shutil.copyfile(input_output_path, output_path)
+        except PermissionError as exc:
+            raise PermissionError(
+                f"无法覆盖文件：{output_path}\n"
+                "该文件可能正在被 Excel/WPS 打开，请先关闭它，或换一个新的文件名后重试。"
+            ) from exc
 
     rb = xlrd.open_workbook(target_path, formatting_info=True)
     wb = copy(rb)
@@ -49,7 +66,7 @@ def write_assignments_to_excel(assignments, input_output_path, header_row=2, out
             room = _merged_or_cell_value(sheet_rb, row_index, room_col)
             if room and room in assignments:
                 sheet_wb.write(row_index, staff_col, _assignment_text(assignments[room]))
-    wb.save(target_path)
+    _save_workbook(wb, target_path)
     print(f"[OK] 监考安排已写入: {target_path}")
 
 
@@ -218,7 +235,7 @@ def split_excel_by_room_groups(input_path, output_path, header_row, rules):
         _write_rows(worksheet, rows, header_row, room_col, staff_col, source_sheet)
         if not selected:
             worksheet.write(header_row + 1, 0, f"未找到匹配考场：{','.join(group)}", _export_styles()[-1])
-    workbook.save(output_path)
+    _save_workbook(workbook, output_path)
     print(f"[OK] 已按考场号导出 {len(groups)} 组: {output_path}")
 
 

@@ -357,13 +357,18 @@ class ProctorArrangerApp(QMainWindow):
         if not split_path.endswith(".xls"):
             split_path += ".xls"
 
-        # 3. 直接输入考场号范围/列表，一行代表一组。
-        rules, ok = QInputDialog.getMultiLineText(
-            self,
-            "输入考场分组规则",
-            "每行一组，按教室编号输入，例如：C101-C112；C201,C203,C205",
-            "C101-C106\nC107-C112",
+        # 3. 直接输入教室编号范围/列表，一行代表一组。
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("设置分组（每行一组）")
+        dialog.setLabelText(
+            "只填写教室编号，每行一组。\n"
+            "支持范围：C101-C112；多个编号：C201,C203,C205"
         )
+        dialog.setOption(QInputDialog.UsePlainTextEditForTextInput, True)
+        dialog.setTextValue("C101-C106\nC107-C112")
+        dialog.resize(520, 340)
+        ok = dialog.exec_() == QInputDialog.Accepted
+        rules = dialog.textValue()
         if not ok:
             return
 
