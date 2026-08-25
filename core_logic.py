@@ -197,13 +197,25 @@ def _build_report(rooms, assignments, teachers, available, warnings):
 
 
 def print_report(report):
-    print("\n" + "=" * 70)
-    print("监考安排结果")
-    print(f"考场: {report['total_rooms']} 个 | 需求: {report['total_needed']} 人 | 已安排: {report['total_assigned']} 人")
-    print(f"缺口: {report['shortage']} 人 | 剩余未安排教师: {report['available_teachers']} 人")
-    print(f"第一监考有经验: {report['experience_first_count']}/{report['total_rooms']}")
-    print(f"男女搭配: {report['gender_mix_count']}/{report['total_rooms']}")
-    print(f"不同部门: {report['department_mix_count']}/{report['total_rooms']}")
-    for warning in report["warnings"]:
-        print(f"[WARN] {warning}")
-    print("=" * 70)
+    total_rooms = report["total_rooms"]
+    print("\n" + "─" * 28)
+    print("【排考结果】")
+    print("─" * 28)
+    print("【排考概况】")
+    print(f"  考场数量：{total_rooms} 个")
+    print(f"  监考需求：{report['total_needed']} 人")
+    print(f"  已安排：  {report['total_assigned']} 人")
+    print(f"  人员缺口：{report['shortage']} 人")
+    print(f"  未安排教师：{report['available_teachers']} 人")
+    print("\n【规则满足情况】")
+    print(f"  有经验第一监考：{report['experience_first_count']}/{total_rooms}")
+    print(f"  男女搭配：      {report['gender_mix_count']}/{total_rooms}")
+    print(f"  不同部门：      {report['department_mix_count']}/{total_rooms}")
+    warnings = report["warnings"]
+    print("\n【异常提醒】")
+    if warnings:
+        for warning in warnings:
+            print(f"  [提醒] {warning}")
+    else:
+        print("  无异常，所有考场均已满足人数需求")
+    print("─" * 28 + "\n")

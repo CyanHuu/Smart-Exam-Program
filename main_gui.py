@@ -11,11 +11,11 @@ from PyQt5.QtWidgets import (
     QInputDialog
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMutex
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QBrush, QColor, QFont, QTextCursor
 
 # 导入核心逻辑
 sys.path.append(str(Path(__file__).parent))
-from core_logic import assign_proctors, preference_weights
+from core_logic import assign_proctors, preference_weights, _teacher_records
 from classroom_2 import get_classroom_info
 from examiner import analyze_teacher_list
 from outputTask import write_assignments_to_excel, split_excel_by_room_groups
@@ -28,7 +28,8 @@ class LogCapture(StringIO):
         self.callback = callback
 
     def write(self, s):
-        if s.strip():  # 忽略纯空白
+        # 换行符也是日志内容，不能过滤，否则多段信息会粘在同一行。
+        if s:
             super().write(s)
             self.callback(s)
 
@@ -47,6 +48,8 @@ class ArrangementWorker:
         self.weights = weights
         self.signals = WorkerSignals()
         self.report = {}
+        self.teacher_pool = []
+        self.classroom_data = []
 
     def run(self):
         # 重定向 print 到日志
@@ -57,6 +60,8 @@ class ArrangementWorker:
             # 捕获所有可能的异常，并确保错误信息进入日志
             classroom_data = get_classroom_info(self.classroom_path)
             teacher_df = analyze_teacher_list(self.examiner_path)
+            self.classroom_data = classroom_data
+            self.teacher_pool = _teacher_records(teacher_df)
             assignments, self.report = assign_proctors(
                 classroom_data, teacher_df, weights=self.weights, return_report=True
             )
@@ -106,6 +111,11 @@ class ProctorArrangerApp(QMainWindow):
         self.setWindowTitle("浙水院监考安排系统for朱巍")
         self.resize(1200, 800)  # 更合理的初始大小
         self.assignments = None
+        self.teacher_pool = []
+        self.room_requirements = {}
+        self.table_row_records = []
+        self.selected_room = ""
+        self.selected_result_row = -1
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         main_layout = QVBoxLayout(self.central_widget)
@@ -164,6 +174,7 @@ class ProctorArrangerApp(QMainWindow):
             "教室编号", "姓名", "工号", "部门", "性别", "经验", "角色"
         ])
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.result_table.cellClicked.connect(self.select_result_row)
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Interactive)  # 允许手动调整，但我们会设默认宽
@@ -176,8 +187,9 @@ class ProctorArrangerApp(QMainWindow):
         # 日志区域
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Courier", 12))
-        self.log_text.setMaximumHeight(200)  # 初始最大高，可被 splitter 覆盖
+        self.log_text.setFont(QFont("Microsoft YaHei UI", 11))
+        self.log_text.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.log_text.setMaximumHeight(240)  # 初始最大高，可被 splitter 覆盖
         self.log_text.setStyleSheet("""
             background-color: #252525;
             color: #e0e0e0;
@@ -186,7 +198,7 @@ class ProctorArrangerApp(QMainWindow):
             padding: 8px;
         """)
         splitter.addWidget(self.log_text)
-        splitter.setSizes([600, 200])  # 初始比例：表格 600px，日志 200px
+        splitter.setSizes([600, 240])  # 初始比例：表格 600px，日志 240px
 
         # 导出按钮
         export_layout = QHBoxLayout()
@@ -201,11 +213,26 @@ class ProctorArrangerApp(QMainWindow):
         export_layout.addWidget(self.btn_export)
         export_layout.addWidget(self.btn_split)
 
+        edit_layout = QHBoxLayout()
+        self.btn_add_person = QPushButton("给选中考场增添人员")
+        self.btn_delete_person = QPushButton("删除选中人员")
+        self.btn_add_person.setStyleSheet(button_style)
+        self.btn_delete_person.setStyleSheet(button_style)
+        self.btn_add_person.clicked.connect(self.add_person_to_room)
+        self.btn_delete_person.clicked.connect(self.delete_person_from_room)
+        self.btn_add_person.setEnabled(False)
+        self.btn_delete_person.setEnabled(False)
+        self.selected_room_label = QLabel("请先点击安排结果中的考场或教师")
+        edit_layout.addWidget(self.btn_add_person)
+        edit_layout.addWidget(self.btn_delete_person)
+        edit_layout.addWidget(self.selected_room_label, 1)
+
         # 组装布局
         main_layout.addWidget(control_widget)
         main_layout.addWidget(QLabel("安排结果："))
         main_layout.addWidget(splitter)  # ← 使用 splitter 替代直接 addWidget
         main_layout.addWidget(QLabel("运行日志："))
+        main_layout.addLayout(edit_layout)
         main_layout.addLayout(export_layout)
 
     def select_classroom(self):
@@ -231,8 +258,15 @@ class ProctorArrangerApp(QMainWindow):
         self.status_label.setText("正在安排中，请等待~")
         self.result_table.setRowCount(0)
         self.assignments = None
+        self.teacher_pool = []
+        self.room_requirements = {}
+        self.table_row_records = []
+        self.selected_room = ""
+        self.selected_result_row = -1
         self.btn_export.setEnabled(False)
         self.btn_split.setEnabled(False)
+        self.btn_add_person.setEnabled(False)
+        self.btn_delete_person.setEnabled(False)
         QApplication.processEvents()
 
         weights = preference_weights(self.preference_combo.currentData())
@@ -244,7 +278,7 @@ class ProctorArrangerApp(QMainWindow):
         thread.start()
 
     def append_log(self, msg):
-        self.log_text.moveCursor(-1)  # Move to end
+        self.log_text.moveCursor(QTextCursor.End)
         self.log_text.insertPlainText(msg)
         self.log_text.ensureCursorVisible()
 
@@ -257,6 +291,8 @@ class ProctorArrangerApp(QMainWindow):
 
         self.assignments = assignments
         self.report = getattr(self.worker, "report", {})
+        self.teacher_pool = getattr(self.worker, "teacher_pool", [])
+        self.room_requirements = dict(getattr(self.worker, "classroom_data", []))
         self.status_label.setText("✅ 安排完成！")
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
         self.display_results_with_merge(assignments)
@@ -270,19 +306,94 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_export.setEnabled(True)
         self.btn_split.setEnabled(True)
 
+    def select_result_row(self, row, _column):
+        """点击任意结果行，选中该行所属考场。"""
+        if row < 0 or row >= len(self.table_row_records):
+            return
+        room, teacher_index = self.table_row_records[row]
+        self.selected_room = room
+        self.selected_result_row = row
+        self.selected_room_label.setText(
+            f"当前考场：{room}（已安排 {len(self.assignments.get(room, []))} 人）"
+        )
+        self.btn_add_person.setEnabled(True)
+        self.btn_delete_person.setEnabled(teacher_index is not None)
+
+    def add_person_to_room(self):
+        if not self.assignments or not self.selected_room:
+            QMessageBox.information(self, "提示", "请先点击一个考场。")
+            return
+        assigned_ids = {
+            teacher[0]
+            for room_teachers in self.assignments.values()
+            for teacher in room_teachers
+        }
+        available = [teacher for teacher in self.teacher_pool if teacher[0] not in assigned_ids]
+        if not available:
+            QMessageBox.information(self, "无法添加", "没有尚未安排的教师可供添加。")
+            return
+        required = self.room_requirements.get(self.selected_room)
+        current = self.assignments[self.selected_room]
+        if required and len(current) >= required:
+            answer = QMessageBox.question(
+                self,
+                "确认添加",
+                f"{self.selected_room} 已满足 {required} 名监考需求，仍要继续添加吗？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        choices = [f"{teacher[1]}（{teacher[0]}）｜{teacher[4]}" for teacher in available]
+        choice, ok = QInputDialog.getItem(
+            self, "添加监考人员", f"选择要添加到 {self.selected_room} 的教师：", choices, 0, False
+        )
+        if not ok:
+            return
+        current.append(available[choices.index(choice)])
+        self.display_results_with_merge(self.assignments)
+        self.status_label.setText(f"✅ 已向 {self.selected_room} 添加 1 名监考教师")
+        self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
+
+    def delete_person_from_room(self):
+        if not self.assignments or not self.selected_room:
+            return
+        if self.selected_result_row < 0 or self.selected_result_row >= len(self.table_row_records):
+            return
+        room, teacher_index = self.table_row_records[self.selected_result_row]
+        if room != self.selected_room or teacher_index is None:
+            QMessageBox.information(self, "提示", "请点击要删除的教师所在行。")
+            return
+        teacher = self.assignments[room][teacher_index]
+        answer = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定从 {room} 删除 {teacher[1]}（{teacher[0]}）吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        del self.assignments[room][teacher_index]
+        self.display_results_with_merge(self.assignments)
+        self.status_label.setText(f"✅ 已从 {room} 删除 1 名监考教师")
+        self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
+
 
 
     def display_results_with_merge(self, assignments):
         self.result_table.setRowCount(0)
+        self.table_row_records = []
+        self.selected_room = ""
+        self.selected_result_row = -1
+        if hasattr(self, "btn_add_person"):
+            self.btn_add_person.setEnabled(False)
+            self.btn_delete_person.setEnabled(False)
+            self.selected_room_label.setText("请先点击安排结果中的考场或教师")
         row = 0
         room_start_row = {}
-        room_teacher_count = {}
+        missing_brush = QBrush(QColor("#FFF2A8"))
+        missing_text_brush = QBrush(QColor("#8A4B00"))
 
-        # 第一遍：计算每个考场的老师数量
-        for room, teachers in assignments.items():
-            room_teacher_count[room] = len(teachers)
-
-        # 第二遍：填充表格并记录起始行
+        # 填充教师行；人数不足时额外增加一行黄色提醒。
         for room, teachers in assignments.items():
             start_row = row
             for t in teachers:
@@ -298,18 +409,53 @@ class ProctorArrangerApp(QMainWindow):
                 exp_str = "有经验" if exp == 1 else "无经验"
                 self.result_table.setItem(row, 5, QTableWidgetItem(exp_str))
                 self.result_table.setItem(row, 6, QTableWidgetItem("第一监考" if row == start_row else "监考人员"))
+                self.table_row_records.append((room, row - start_row))
+                row += 1
+
+            required = self.room_requirements.get(room, len(teachers))
+            missing = max(0, required - len(teachers))
+            if missing:
+                self.result_table.insertRow(row)
+                self.result_table.setItem(row, 0, QTableWidgetItem(""))
+                self.result_table.setItem(row, 1, QTableWidgetItem(f"缺少 {missing} 名监考教师"))
+                self.result_table.setItem(row, 6, QTableWidgetItem("待补充"))
+                for column in range(7):
+                    item = self.result_table.item(row, column)
+                    if item is None:
+                        item = QTableWidgetItem("")
+                        self.result_table.setItem(row, column, item)
+                    item.setBackground(missing_brush)
+                    item.setForeground(missing_text_brush)
+                self.table_row_records.append((room, None))
+                row += 1
+
+            # 需求人数为空或异常时也保留一个可点击的考场行。
+            if row == start_row:
+                self.result_table.insertRow(row)
+                self.result_table.setItem(row, 0, QTableWidgetItem(""))
+                self.result_table.setItem(row, 1, QTableWidgetItem("暂无监考人员"))
+                self.result_table.setItem(row, 6, QTableWidgetItem("待补充"))
+                for column in range(7):
+                    item = self.result_table.item(row, column)
+                    if item is None:
+                        item = QTableWidgetItem("")
+                        self.result_table.setItem(row, column, item)
+                    item.setBackground(missing_brush)
+                    item.setForeground(missing_text_brush)
+                self.table_row_records.append((room, None))
                 row += 1
             room_start_row[room] = start_row
 
         # 第三遍：合并考场单元格
-        current_row = 0
         for room, teachers in assignments.items():
             count = len(teachers)
-            if count > 0:
-                self.result_table.setItem(current_row, 0, QTableWidgetItem(room))
-                if count > 1:
-                    self.result_table.setSpan(current_row, 0, count, 1)
-                current_row += count
+            start_row = room_start_row[room]
+            self.result_table.setItem(start_row, 0, QTableWidgetItem(room))
+            end_row = start_row
+            while end_row + 1 < len(self.table_row_records) and self.table_row_records[end_row + 1][0] == room:
+                end_row += 1
+            if end_row > start_row:
+                self.result_table.setSpan(start_row, 0, end_row - start_row + 1, 1)
 
         # 让所有列根据内容自动调整宽度
         self.result_table.resizeColumnsToContents()
