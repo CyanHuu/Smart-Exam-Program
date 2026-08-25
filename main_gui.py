@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QTextEdit, QHeaderView, QSplitter, QComboBox,
-    QInputDialog, QDialog
+    QInputDialog, QDialog, QSizePolicy, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMutex
 from PyQt5.QtGui import QBrush, QColor, QFont, QTextCursor
@@ -23,7 +23,11 @@ from core_logic import (
 )
 from classroom_2 import get_classroom_info
 from examiner import analyze_teacher_list
-from outputTask import write_assignments_to_excel, split_excel_by_room_groups
+from outputTask import (
+    get_schedule_rooms,
+    write_assignments_to_excel,
+    split_excel_by_room_groups,
+)
 
 
 # ====== 日志重定向器 ======
@@ -190,7 +194,9 @@ class ProctorArrangerApp(QMainWindow):
         self.result_table.resizeColumnsToContents()
 
         # ====== 关键修改 1：使用 QSplitter 实现可拖动分隔 ======
-        splitter = QSplitter(Qt.Vertical)
+        splitter = QSplitter(Qt.Horizontal)
+        self.result_splitter = splitter
+        splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         splitter.addWidget(self.result_table)
 
         # 日志区域
@@ -198,7 +204,7 @@ class ProctorArrangerApp(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Microsoft YaHei UI", 11))
         self.log_text.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.log_text.setMaximumHeight(240)  # 初始最大高，可被 splitter 覆盖
+        self.log_text.setMinimumWidth(280)
         self.log_text.setStyleSheet("""
             background-color: #252525;
             color: #e0e0e0;
@@ -206,8 +212,16 @@ class ProctorArrangerApp(QMainWindow):
             border-radius: 6px;
             padding: 8px;
         """)
-        splitter.addWidget(self.log_text)
-        splitter.setSizes([600, 240])  # 初始比例：表格 600px，日志 240px
+        log_panel = QWidget()
+        log_panel_layout = QVBoxLayout(log_panel)
+        log_panel_layout.setContentsMargins(4, 0, 0, 0)
+        self.log_title = QLabel("运行日志")
+        log_panel_layout.addWidget(self.log_title)
+        log_panel_layout.addWidget(self.log_text)
+        splitter.addWidget(log_panel)
+        splitter.setSizes([850, 350])  # 左侧结果表，右侧运行日志
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
 
         # 导出按钮
         export_layout = QHBoxLayout()
@@ -244,8 +258,7 @@ class ProctorArrangerApp(QMainWindow):
         # 组装布局
         main_layout.addWidget(control_widget)
         main_layout.addWidget(QLabel("安排结果："))
-        main_layout.addWidget(splitter)  # ← 使用 splitter 替代直接 addWidget
-        main_layout.addWidget(QLabel("运行日志："))
+        main_layout.addWidget(splitter, 1)  # 中间区域填满上下剩余空间
         main_layout.addLayout(edit_layout)
         main_layout.addLayout(export_layout)
 
@@ -269,6 +282,9 @@ class ProctorArrangerApp(QMainWindow):
 
     def run_arrangement(self):
         self.log_text.clear()
+        self.log_text.show()
+        self.log_title.show()
+        self.result_splitter.setSizes([850, 350])
         self.status_label.setText("正在安排中，请等待~")
         self.result_table.setRowCount(0)
         self.assignments = None
@@ -300,6 +316,9 @@ class ProctorArrangerApp(QMainWindow):
 
     def on_finished(self, assignments, error):
         if error or assignments is None:
+            self.log_text.show()
+            self.log_title.show()
+            self.result_splitter.setSizes([650, 550])
             QMessageBox.critical(self, "错误", f"安排失败：\n{error}")
             self.status_label.setText("❌ 安排失败")
             self.status_label.setStyleSheet("color: #ff4444; font-weight: bold; font-size: 14pt;")
@@ -310,16 +329,17 @@ class ProctorArrangerApp(QMainWindow):
         self.teacher_pool = getattr(self.worker, "teacher_pool", [])
         self.room_requirements = dict(getattr(self.worker, "classroom_data", []))
         self.backup_assignments = getattr(self.worker, "backup_assignments", {})
-        self.status_label.setText("✅ 安排完成！")
+        self.status_label.setText(
+            f"✅ 排考完成：{self.report.get('total_rooms', 0)} 个考场，"
+            f"已安排 {self.report.get('total_assigned', 0)} 人，"
+            f"缺口 {self.report.get('shortage', 0)} 人"
+        )
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
         self.display_results_with_merge(assignments)
-        if self.report:
-            self.append_log(
-                f"\n缺口：{self.report.get('shortage', 0)} 人；"
-                f"第一监考有经验：{self.report.get('experience_first_count', 0)}/{self.report.get('total_rooms', 0)}\n"
-            )
-            for warning in self.report.get("warnings", []):
-                self.append_log(f"⚠️ {warning}\n")
+        # 成功后保留日志框，避免界面留下空白区域；结果表仍占主要空间。
+        self.log_text.show()
+        self.log_title.show()
+        self.result_splitter.setSizes([850, 350])
         self.btn_export.setEnabled(True)
         self.btn_split.setEnabled(True)
 
@@ -596,6 +616,7 @@ class ProctorArrangerApp(QMainWindow):
         # 让所有列根据内容自动调整宽度
         self.result_table.resizeColumnsToContents()
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.result_table.scrollToTop()
 
 
 
@@ -639,18 +660,47 @@ class ProctorArrangerApp(QMainWindow):
         if not split_path.endswith(".xls"):
             split_path += ".xls"
 
-        # 3. 直接输入教室编号范围/列表，一行代表一组。
-        dialog = QInputDialog(self)
-        dialog.setWindowTitle("设置分组（每行一组）")
-        dialog.setLabelText(
-            "只填写教室编号，每行一组。\n"
-            "支持范围：C101-C112；多个编号：C201,C203,C205"
-        )
-        dialog.setOption(QInputDialog.UsePlainTextEditForTextInput, True)
-        dialog.setTextValue("C101-C106\nC107-C112")
-        dialog.resize(520, 340)
-        ok = dialog.exec_() == QInputDialog.Accepted
-        rules = dialog.textValue()
+        # 3. 选择自动识别或手动指定分组范围。
+        rooms = get_schedule_rooms(main_path, header_row=2)
+        if not rooms:
+            QMessageBox.information(self, "无法分组", "排考表中没有识别到有效教室编号。")
+            return
+        auto_rules = ",".join(rooms)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("设置分组方式")
+        dialog.resize(560, 360)
+        dialog_layout = QVBoxLayout(dialog)
+        dialog_layout.addWidget(QLabel("选择分组方式："))
+        mode_combo = QComboBox()
+        mode_combo.addItem("自动识别表格中的全部教室（1组）", "auto")
+        mode_combo.addItem("手动指定范围或考场（多行多组）", "manual")
+        dialog_layout.addWidget(mode_combo)
+        dialog_layout.addWidget(QLabel(
+            "自动模式会读取当前排考表中的全部教室。\n"
+            "手动模式示例：101-112 或 101,103,105，每行一组。"
+        ))
+        rules_edit = QTextEdit()
+        rules_edit.setPlainText(auto_rules)
+        rules_edit.setReadOnly(True)
+        dialog_layout.addWidget(rules_edit, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+
+        def update_group_mode(index):
+            is_manual = mode_combo.itemData(index) == "manual"
+            rules_edit.setReadOnly(not is_manual)
+            if is_manual and rules_edit.toPlainText() == auto_rules:
+                rules_edit.clear()
+                rules_edit.setPlaceholderText("例如：101-112\n或：101,103,105")
+            elif not is_manual:
+                rules_edit.setPlainText(auto_rules)
+                rules_edit.setPlaceholderText("")
+
+        mode_combo.currentIndexChanged.connect(update_group_mode)
+        ok = dialog.exec_() == QDialog.Accepted
+        rules = rules_edit.toPlainText()
         if not ok:
             return
 

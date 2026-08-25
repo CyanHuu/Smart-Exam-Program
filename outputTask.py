@@ -136,6 +136,12 @@ def _load_schedule(input_path, header_row):
     return rb, sheet, headers, room_col, staff_col, records
 
 
+def get_schedule_rooms(input_path, header_row=2):
+    """读取排考结果中的全部教室编号，供分组窗口自动识别范围。"""
+    _, _, _, room_col, _, records = _load_schedule(input_path, header_row)
+    return list(dict.fromkeys(row[room_col] for row in records if row[room_col]))
+
+
 def _export_styles():
     """分组表使用与原模板一致的清晰打印样式。"""
     title = xlwt.easyxf(
