@@ -7,17 +7,18 @@ from io import StringIO
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTableWidget,
-    QTableWidgetItem, QTextEdit, QHeaderView, QSplitter
+    QTableWidgetItem, QTextEdit, QHeaderView, QSplitter, QComboBox,
+    QInputDialog
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMutex
 from PyQt5.QtGui import QFont
 
 # 导入核心逻辑
 sys.path.append(str(Path(__file__).parent))
-from core_logic import assign_proctors
+from core_logic import assign_proctors, preference_weights
 from classroom_2 import get_classroom_info
 from examiner import analyze_teacher_list
-from outputTask import write_assignments_to_excel, split_excel_by_serial
+from outputTask import write_assignments_to_excel, split_excel_by_room_groups
 
 
 # ====== 日志重定向器 ======
@@ -40,10 +41,12 @@ class WorkerSignals(QObject):
 
 # ====== 后台工作类 ======
 class ArrangementWorker:
-    def __init__(self, classroom_path, examiner_path):
+    def __init__(self, classroom_path, examiner_path, weights):
         self.classroom_path = classroom_path
         self.examiner_path = examiner_path
+        self.weights = weights
         self.signals = WorkerSignals()
+        self.report = {}
 
     def run(self):
         # 重定向 print 到日志
@@ -54,7 +57,9 @@ class ArrangementWorker:
             # 捕获所有可能的异常，并确保错误信息进入日志
             classroom_data = get_classroom_info(self.classroom_path)
             teacher_df = analyze_teacher_list(self.examiner_path)
-            assignments = assign_proctors(classroom_data, teacher_df)
+            assignments, self.report = assign_proctors(
+                classroom_data, teacher_df, weights=self.weights, return_report=True
+            )
             self.signals.finished.emit(assignments, "")
         except Exception as e:
             import traceback
@@ -133,14 +138,30 @@ class ProctorArrangerApp(QMainWindow):
 
         control_layout.addLayout(room_hbox)
         control_layout.addLayout(teacher_hbox)
+
+        preference_hbox = QHBoxLayout()
+        preference_hbox.addWidget(QLabel("排考偏好"))
+        self.preference_combo = QComboBox()
+        preferences = [
+            ("default", "默认：经验 > 男女搭配 > 不同部门"),
+            ("experience", "经验优先：经验 > 男女搭配 > 部门"),
+            ("gender", "男女搭配优先：男女搭配 > 经验 > 部门"),
+            ("department", "部门均衡优先：部门 > 经验 > 男女搭配"),
+            ("experience_only", "只优先安排有经验教师"),
+        ]
+        for key, label in preferences:
+            self.preference_combo.addItem(label, key)
+        self.preference_combo.setToolTip("选择规则侧重点，系统会自动处理内部评分")
+        preference_hbox.addWidget(self.preference_combo, 1)
+        control_layout.addLayout(preference_hbox)
         control_layout.addWidget(self.btn_run)
         control_layout.addWidget(self.status_label)
 
         # 表格
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(6)
+        self.result_table.setColumnCount(7)
         self.result_table.setHorizontalHeaderLabels([
-            "教室编号", "姓名", "工号", "部门", "性别", "经验"
+            "教室编号", "姓名", "工号", "部门", "性别", "经验", "角色"
         ])
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
         header = self.result_table.horizontalHeader()
@@ -214,7 +235,8 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_split.setEnabled(False)
         QApplication.processEvents()
 
-        self.worker = ArrangementWorker(self.classroom_path, self.examiner_path)
+        weights = preference_weights(self.preference_combo.currentData())
+        self.worker = ArrangementWorker(self.classroom_path, self.examiner_path, weights)
         self.worker.signals.finished.connect(self.on_finished)
         self.worker.signals.log_message.connect(self.append_log)
         thread = threading.Thread(target=self.worker.run)
@@ -234,9 +256,17 @@ class ProctorArrangerApp(QMainWindow):
             return
 
         self.assignments = assignments
+        self.report = getattr(self.worker, "report", {})
         self.status_label.setText("✅ 安排完成！")
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
         self.display_results_with_merge(assignments)
+        if self.report:
+            self.append_log(
+                f"\n缺口：{self.report.get('shortage', 0)} 人；"
+                f"第一监考有经验：{self.report.get('experience_first_count', 0)}/{self.report.get('total_rooms', 0)}\n"
+            )
+            for warning in self.report.get("warnings", []):
+                self.append_log(f"⚠️ {warning}\n")
         self.btn_export.setEnabled(True)
         self.btn_split.setEnabled(True)
 
@@ -267,6 +297,7 @@ class ProctorArrangerApp(QMainWindow):
                 self.result_table.setItem(row, 4, QTableWidgetItem(gender_str))
                 exp_str = "有经验" if exp == 1 else "无经验"
                 self.result_table.setItem(row, 5, QTableWidgetItem(exp_str))
+                self.result_table.setItem(row, 6, QTableWidgetItem("第一监考" if row == start_row else "监考人员"))
                 row += 1
             room_start_row[room] = start_row
 
@@ -289,22 +320,31 @@ class ProctorArrangerApp(QMainWindow):
     def export_data(self):
         if not self.assignments:
             return
+        template_path, _ = QFileDialog.getOpenFileName(
+            self, "选择监考安排模板", "", "Excel 97-2003 (*.xls)"
+        )
+        if not template_path:
+            return
         path, _ = QFileDialog.getSaveFileName(self, "保存监考安排表", "", "Excel 97-2003 (*.xls)")
         if path:
-            if not path.endswith(".xls"):
+            if not path.lower().endswith(".xls"):
                 path += ".xls"
             try:
-                write_assignments_to_excel(self.assignments, path, header_row=2)
+                write_assignments_to_excel(
+                    self.assignments, template_path, header_row=2, output_path=path
+                )
+                self.last_export_path = path
                 QMessageBox.information(self, "成功", f"数据已导出至：\n{path}")
             except Exception as e:
                 self.append_log(f"导出失败: {e}\n")
                 QMessageBox.critical(self, "导出失败", str(e))
 
     def split_export(self):
-        # 1. 选择已导出的主表文件
-        main_path, _ = QFileDialog.getOpenFileName(
-            self, "选择已导出的监考安排主表", "", "Excel 97-2003 (*.xls)"
-        )
+        main_path = getattr(self, "last_export_path", "")
+        if not main_path:
+            main_path, _ = QFileDialog.getOpenFileName(
+                self, "选择已导出的监考安排主表", "", "Excel 97-2003 (*.xls)"
+            )
         if not main_path:
             return
 
@@ -317,21 +357,21 @@ class ProctorArrangerApp(QMainWindow):
         if not split_path.endswith(".xls"):
             split_path += ".xls"
 
-        # 3. 输入分组数量（sheet count）
-        from PyQt5.QtWidgets import QInputDialog
-        sheet_count, ok = QInputDialog.getInt(
-            self, "输入分组数量", "请输入要分成几个工作表（Sheet）：",
-            value=4, min=1, max=20
+        # 3. 直接输入考场号范围/列表，一行代表一组。
+        rules, ok = QInputDialog.getMultiLineText(
+            self,
+            "输入考场分组规则",
+            "每行一组，按教室编号输入，例如：C101-C112；C201,C203,C205",
+            "C101-C106\nC107-C112",
         )
         if not ok:
             return
 
         # 4. 执行分组
         try:
-            # 注意：split_excel_by_serial 需要读取主表并按序号分组写入新文件
-            split_excel_by_serial(main_path, split_path, header_row=2, sheet_count=sheet_count)
+            groups = split_excel_by_room_groups(main_path, split_path, header_row=2, rules=rules)
             QMessageBox.information(self, "成功", f"分组表已导出至：\n{split_path}")
-            self.append_log("\n" + f"[分组导出] 成功导出 {sheet_count} 个分组到 {split_path}\n")
+            self.append_log("\n" + f"[分组导出] 已按考场号生成分组：{split_path}\n")
         except Exception as e:
             error_msg = f"分组导出失败: {str(e)}"
             self.append_log("\n" +f"[错误] {error_msg}\n")

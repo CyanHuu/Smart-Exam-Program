@@ -1,177 +1,209 @@
-from classroom_2 import get_classroom_info
-from examiner import analyze_teacher_list
-from outputTask import write_assignments_to_excel, split_excel_by_serial
+"""监考人员分配核心逻辑。
+
+硬约束：教师在一次排考中只能出现一次。
+软规则：经验、性别搭配、部门差异，无法全部满足时保留可执行结果并报告原因。
+"""
+
+import random
 
 
+PREFERENCE_WEIGHTS = {
+    "default": {"experience": 60, "gender": 25, "department": 15},
+    "experience": {"experience": 70, "gender": 15, "department": 15},
+    "gender": {"experience": 25, "gender": 60, "department": 15},
+    "department": {"experience": 25, "gender": 15, "department": 60},
+    "experience_only": {"experience": 100, "gender": 0, "department": 0},
+}
 
-def assign_proctors(classroom_data, teacher_df):
-    """为考场安排监考老师，实现经验>男女搭配>不同部门的优先级规则"""
 
-    # 获取教室信息
-    classrooms = [item[0] for item in classroom_data]
-    classroom_to_num = {item[0]: item[1] for item in classroom_data}
+def preference_weights(preference="default"):
+    """把面向用户的偏好名称转换成内部权重，避免用户直接操作百分比。"""
+    try:
+        return dict(PREFERENCE_WEIGHTS[preference])
+    except KeyError as exc:
+        raise ValueError(f"未知排考偏好: {preference}") from exc
 
-    # 按优先级排序：有经验(1) > 性别(女=0) > 部门
-    teacher_df = teacher_df.sort_values(
-        by=['experience_col', 'gender_col', 'dept_col'],
-        ascending=[False, True, True]
-    ).reset_index(drop=True)
 
-    # 创建老师列表（按优先级排序）
-    teacher_list = []
-    for _, row in teacher_df.iterrows():
-        teacher_list.append((
-            str(row['id_col']),  # 工号
-            str(row['name_col']),  # 姓名
-            row['experience_col'],  # 经验 - 0或1
-            row['gender_col'], #性别 0女1男
-            str(row['dept_col'])  # 部门
+def _normalise_weights(weights):
+    weights = weights or {}
+    result = {
+        "experience": float(weights.get("experience", 60)),
+        "gender": float(weights.get("gender", 25)),
+        "department": float(weights.get("department", 15)),
+    }
+    if any(value < 0 for value in result.values()):
+        raise ValueError("规则权重不能为负数")
+    if not any(result.values()):
+        raise ValueError("至少需要设置一个大于0的规则权重")
+    return result
+
+
+def _flag(value, field):
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field}必须是0或1") from exc
+    if value not in (0, 1):
+        raise ValueError(f"{field}必须是0或1")
+    return value
+
+
+def _teacher_records(teacher_df):
+    required = {"id_col", "name_col", "experience_col", "gender_col", "dept_col"}
+    missing = required.difference(teacher_df.columns)
+    if missing:
+        raise ValueError(f"教师数据缺少标准字段: {', '.join(sorted(missing))}")
+
+    records = []
+    seen_ids = set()
+    for index, row in teacher_df.iterrows():
+        teacher_id = str(row["id_col"]).strip()
+        name = str(row["name_col"]).strip()
+        dept = str(row["dept_col"]).strip()
+        if not teacher_id or teacher_id.lower() == "nan":
+            raise ValueError(f"教师表第{index + 2}行工号为空")
+        if not name or name.lower() == "nan":
+            raise ValueError(f"教师表第{index + 2}行姓名为空")
+        if teacher_id in seen_ids:
+            raise ValueError(f"教师工号重复: {teacher_id}")
+        seen_ids.add(teacher_id)
+        records.append((
+            teacher_id,
+            name,
+            _flag(row["experience_col"], "经验"),
+            _flag(row["gender_col"], "性别"),
+            dept if dept.lower() != "nan" else "未填写部门",
         ))
-    # 按优先级排序：经验(1>0) > 性别(女=0, 男=1) > 部门(按部门字母顺序)
+    if not records:
+        raise ValueError("教师名单为空")
+    return records
 
-    # 检查总老师数是否足够
-    total_teachers = len(teacher_list)
-    total_needed = sum(classroom_to_num.values())
-    if total_teachers < total_needed:
-        print(f"警告: 老师总数({total_teachers})小于所需总人数({total_needed})，将尽可能安排")
 
-    # 计算有经验老师数量
-    experienced_teachers = [t for t in teacher_list if t[2] == 1]
-    experienced_count = len(experienced_teachers)
-    num_classrooms = len(classrooms)
-    if experienced_count < num_classrooms:
-        print(f"警告: 有经验老师数量({experienced_count})少于考场数量({num_classrooms})，"
-              f"部分考场可能都是没有经验的老师哦。")
+def _room_records(classroom_data):
+    if not classroom_data:
+        raise ValueError("考场名单为空")
+    rooms = []
+    seen = set()
+    for index, item in enumerate(classroom_data, start=1):
+        if len(item) < 2:
+            raise ValueError(f"第{index}个考场记录格式错误")
+        room = str(item[0]).strip()
+        try:
+            needed = int(item[1])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"考场 {room or index} 的监考人数必须是正整数") from exc
+        if not room or room.lower() == "nan":
+            raise ValueError(f"第{index}个考场编号为空")
+        if room in seen:
+            raise ValueError(f"考场编号重复: {room}")
+        if needed <= 0:
+            raise ValueError(f"考场 {room} 的监考人数必须是正整数")
+        seen.add(room)
+        rooms.append((room, needed))
+    return rooms
 
-    # 分类并按性别排序（女优先）
-    experienced = sorted([t for t in teacher_list if t[2] == 1], key=lambda x: x[3])
-    inexperienced = sorted([t for t in teacher_list if t[2] == 0], key=lambda x: x[3])
 
-    # ✅ 核心：使用列表直接管理，不再用 assigned 集合做冗余判断
-    # 所有老师按“先有经验，后无经验”排序，准备依次分配
-    all_teachers = experienced + inexperienced
-    assigned_flags = [False] * len(all_teachers)  # 标记是否已分配
+def _score_teacher(teacher, current, weights):
+    _, _, experience, gender, department = teacher
+    genders = {item[3] for item in current}
+    departments = {item[4] for item in current}
+    return (
+        experience * weights["experience"]
+        + (1 if genders and gender not in genders else 0) * weights["gender"]
+        + (1 if departments and department not in departments else 0) * weights["department"]
+    )
 
-    assignments = {room: [] for room in classrooms}
 
-    # === 阶段1：每个考场先分配1名有经验老师（如果还有）===
-    for room in classrooms:
-        assigned = False
-        for i, teacher in enumerate(experienced):
-            if not assigned_flags[all_teachers.index(teacher)]:
-                assignments[room].append(teacher)
-                assigned_flags[all_teachers.index(teacher)] = True
-                assigned = True
-                break
-        if not assigned:
-            print(f"⚠️  警告：考场 {room} 无法分配有经验老师")
+def assign_proctors(classroom_data, teacher_df, weights=None, random_seed=None, return_report=False):
+    """按规则分配监考人员，默认返回旧版兼容的 assignments 字典。"""
+    rooms = _room_records(classroom_data)
+    teachers = _teacher_records(teacher_df)
+    weights = _normalise_weights(weights)
+    rng = random.Random(random_seed)
+    available = {teacher[0]: teacher for teacher in teachers}
+    assignments = {room: [] for room, _ in rooms}
+    warnings = []
 
-    # === 阶段2：填满所有考场，必须满足人数需求 ===
-    for room in classrooms:
+    # 第一监考只在当前未使用的教师中选择，硬性防止跨考场重复。
+    for room, _ in rooms:
+        experienced = [teacher for teacher in available.values() if teacher[2] == 1]
+        candidates = experienced or list(available.values())
+        if not candidates:
+            warnings.append(f"考场 {room} 无可用教师，无法安排第一监考")
+            continue
+        best_score = max(_score_teacher(teacher, [], weights) for teacher in candidates)
+        tied = [teacher for teacher in candidates if _score_teacher(teacher, [], weights) == best_score]
+        selected = rng.choice(tied)
+        assignments[room].append(selected)
+        del available[selected[0]]
+        if not experienced:
+            warnings.append(f"考场 {room} 未能安排有经验的第一监考")
+
+    # 补足考场人数；同分候选随机，避免固定名单顺序造成长期偏置。
+    for room, needed in rooms:
         current = assignments[room]
-        needed = classroom_to_num[room]
-        while len(current) < needed:
-            best_teacher = None
-            best_idx = -1
-            current_genders = {t[3] for t in current}
-            current_depts = {t[4] for t in current}
+        while len(current) < needed and available:
+            candidates = list(available.values())
+            scores = {teacher[0]: _score_teacher(teacher, current, weights) for teacher in candidates}
+            best_score = max(scores.values())
+            tied = [teacher for teacher in candidates if scores[teacher[0]] == best_score]
+            selected = rng.choice(tied)
+            current.append(selected)
+            del available[selected[0]]
+        if len(current) < needed:
+            warnings.append(f"考场 {room} 缺少 {needed - len(current)} 名监考教师")
 
-            # 优先找异性
-            for i, teacher in enumerate(all_teachers):
-                if assigned_flags[i]:
-                    continue
-                # 优先使用无经验老师，但也可用有经验的（如果前面没分完）
-                if teacher[3] not in current_genders:
-                    best_teacher = teacher
-                    best_idx = i
-                    break
-
-            # 如果没找到异性，找不同部门
-            if best_teacher is None:
-                for i, teacher in enumerate(all_teachers):
-                    if assigned_flags[i]:
-                        continue
-                    if teacher[4] not in current_depts:
-                        best_teacher = teacher
-                        best_idx = i
-                        break
-
-            # 最后：随便找一个可用的
-            if best_teacher is None:
-                for i, teacher in enumerate(all_teachers):
-                    if not assigned_flags[i]:
-                        best_teacher = teacher
-                        best_idx = i
-                        break
-
-            # 必须分配，除非无老师可用
-            if best_teacher is None:
-                print(f"错误：老师已耗尽，无法填满考场 {room}")
-                break
-
-            current.append(best_teacher)
-            assigned_flags[best_idx] = True
-
-    # === 输出结果 ===
-    print("\n" + "=" * 80)
-    print("考场监考老师安排结果")
-    print("=" * 80)
-
-    all_filled = True
-    for room in classrooms:
-        actual = len(assignments[room])
-        needed = classroom_to_num[room]
-        if actual < needed:
-            all_filled = False
-        print(f"\n考场: {room}")
-        status = "✅" if actual >= needed else "❌"
-        print(f"监考老师数量: {actual} (需求: {needed}) {status}")
-        for i, (id_, name, exp, gender, dept) in enumerate(assignments[room], 1):
-            gender_str = "女" if gender == 0 else "男"
-            exp_str = "有经验" if exp == 1 else "无经验"
-            print(f"  {i}. {name} (工号: {id_}, 部门: {dept}, 性别: {gender_str}, 经验: {exp_str})")
-
-    # 统计
-    total_assigned = sum(len(assignments[room]) for room in classrooms)
-    exp_satisfied = sum(1 for t in assignments.values() if any(teacher[2] == 1 for teacher in t))
-    mixed_gender = sum(1 for t in assignments.values() if len(set(teacher[3] for teacher in t)) == 2)
-
-    print("\n" + "=" * 30)
-    print(f"📊 分配统计")
-    print("\n" + f"考场总数: {len(classrooms)}, 总共需要: {total_needed} 名监考老师")
-    print("\n" + f"总计安排老师: {total_assigned} 人")
-    print("\n" + f"剩余可用老师: {len(all_teachers) - total_assigned} 人")
-    print("\n" + f"有经验老师总数: {len(experienced)} 人")
-    print("\n" + f"考场有经验老师满足率: {exp_satisfied}/{len(classrooms)}")
-    print("\n" + f"考场男女搭配满足率: {mixed_gender}/{len(classrooms)}")
-    if total_assigned < total_needed:
-        print("❌ 警告: 有考场未达到所需监考人数！")
-    else:
-        print("✅ 所有考场均已满足监考人数需求！")
-    print("\n" + "=" * 50)
-
-    return assignments
-
-def main():
-# 将该功能提供给用户使用，有简易的操作界面，主要是：用户选择本地的‘classroom_path’和‘examiner_path’，读取教室信息及监考老师信息，用户点击‘立即安排’，
-#页面提示‘正在安排中，请等待~’，并将监考安排的输出结果显示在页面上，用户确认无误后可以点击‘数据导出’，选择本地‘write_excel_path’将监考人员数据写入表格，并提供‘分组导出’，
-    classroom_path = '/Users/jiangye/Documents/小程序相关/教室编号输入.xls'
-    examiner_path = '/Users/jiangye/Documents/小程序相关/2.老师名单.xls'
-    classroom = get_classroom_info(classroom_path)
-    examiner = analyze_teacher_list(examiner_path)
-    # 执行安排
-    assignments = assign_proctors(classroom, examiner)
-    if not assignments:
-        print("❌ 监考分配失败，无法写入。")
-        return
-    #输出数据
-    write_excel_path = '/Users/jiangye/Documents/小程序相关/3.目标写入表格.xls'
-    split_excel_path = '/Users/jiangye/Documents/小程序相关/输出分组表格.xls'
-    header_row = 2
-    sheet_count = 4
-    write_assignments_to_excel(assignments,write_excel_path,header_row)
-    split_excel_by_serial(write_excel_path,split_excel_path,header_row,sheet_count)
+    report = _build_report(rooms, assignments, teachers, available, warnings)
+    print_report(report)
+    return (assignments, report) if return_report else assignments
 
 
-if __name__ == "__main__":
-    main()
+def _build_report(rooms, assignments, teachers, available, warnings):
+    total_needed = sum(needed for _, needed in rooms)
+    total_assigned = sum(len(room_teachers) for room_teachers in assignments.values())
+    unfilled = []
+    experience_ok = 0
+    gender_mix_ok = 0
+    department_mix_ok = 0
+    for room, needed in rooms:
+        current = assignments[room]
+        missing = max(0, needed - len(current))
+        if missing:
+            unfilled.append({"room": room, "needed": needed, "assigned": len(current), "missing": missing})
+        if current and current[0][2] == 1:
+            experience_ok += 1
+        if len({teacher[3] for teacher in current}) > 1:
+            gender_mix_ok += 1
+        if len({teacher[4] for teacher in current}) > 1:
+            department_mix_ok += 1
+    counts = {teacher[0]: 0 for teacher in teachers}
+    names = {teacher[0]: teacher[1] for teacher in teachers}
+    for room_teachers in assignments.values():
+        for teacher in room_teachers:
+            counts[teacher[0]] += 1
+    return {
+        "total_rooms": len(rooms),
+        "total_needed": total_needed,
+        "total_assigned": total_assigned,
+        "shortage": max(0, total_needed - total_assigned),
+        "available_teachers": len(available),
+        "unfilled_rooms": unfilled,
+        "experience_first_count": experience_ok,
+        "gender_mix_count": gender_mix_ok,
+        "department_mix_count": department_mix_ok,
+        "teacher_counts": {names[teacher_id]: count for teacher_id, count in counts.items()},
+        "warnings": warnings,
+    }
+
+
+def print_report(report):
+    print("\n" + "=" * 70)
+    print("监考安排结果")
+    print(f"考场: {report['total_rooms']} 个 | 需求: {report['total_needed']} 人 | 已安排: {report['total_assigned']} 人")
+    print(f"缺口: {report['shortage']} 人 | 剩余未安排教师: {report['available_teachers']} 人")
+    print(f"第一监考有经验: {report['experience_first_count']}/{report['total_rooms']}")
+    print(f"男女搭配: {report['gender_mix_count']}/{report['total_rooms']}")
+    print(f"不同部门: {report['department_mix_count']}/{report['total_rooms']}")
+    for warning in report["warnings"]:
+        print(f"[WARN] {warning}")
+    print("=" * 70)

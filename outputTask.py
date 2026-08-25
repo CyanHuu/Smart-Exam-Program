@@ -1,184 +1,235 @@
-import math
-import pandas as pd
+import re
+import re
+import shutil
+
 import xlrd
 import xlwt
 from xlutils.copy import copy
-from xlwt import Alignment
-from xlwt import Workbook
 
 
-def write_assignments_to_excel(assignments, input_output_path,header_row):
+def _find_column(headers, keywords):
+    # 关键词顺序代表业务优先级：先匹配实际教室编号，再匹配考试系统内部的考场号。
+    for keyword in keywords:
+        for index, header in enumerate(headers):
+            text = str(header).strip().lower()
+            if keyword in text:
+                return index
+    return None
+
+
+def _assignment_text(teachers):
+    return "，".join(
+        f"{teacher[1]}（第一监考）" if index == 0 else str(teacher[1])
+        for index, teacher in enumerate(teachers)
+    )
+
+
+def write_assignments_to_excel(assignments, input_output_path, header_row=2, output_path=None):
+    """把安排写入模板。
+
+    旧调用仍可传入同一个路径；GUI 可通过 output_path 指定新的保存路径。
     """
-    将 assignments 写入 .xls 文件的每个 sheet 的 '监考人员' 列
-    处理合并单元格
-    """
-    rb = xlrd.open_workbook(input_output_path, formatting_info=True)
+    target_path = output_path or input_output_path
+    if output_path and output_path != input_output_path:
+        shutil.copyfile(input_output_path, output_path)
+
+    rb = xlrd.open_workbook(target_path, formatting_info=True)
     wb = copy(rb)
-
     for sheet_index in range(rb.nsheets):
         sheet_rb = rb.sheet_by_index(sheet_index)
         sheet_wb = wb.get_sheet(sheet_index)
-
-        # 查找列
-        header_row = header_row
-        classroom_col_idx = None
-        proctor_col_idx = None
-        for idx, cell in enumerate(sheet_rb.row_values(header_row)):
-            if '教室编号' in str(cell):
-                classroom_col_idx = idx
-            elif '监考人员' in str(cell):
-                proctor_col_idx = idx
-
-        if classroom_col_idx is None or proctor_col_idx is None:
-            print(f"⚠️ 跳过 sheet {sheet_index}: 列未找到")
+        headers = sheet_rb.row_values(header_row)
+        room_col = _find_column(headers, ["教室编号", "考场号", "room"])
+        staff_col = _find_column(headers, ["监考人员", "监考教师", "staff", "proctor"])
+        if room_col is None or staff_col is None:
+            print(f"⚠️ 跳过 sheet {sheet_index}: 未找到考场或监考人员列")
             continue
 
-        # 收集所有有效教室
-        classroom_rows = []  # [(row_idx, classroom_name), ...]
-        for row_idx in range(header_row+1, sheet_rb.nrows):
-            val = None
-            in_merged = False
-            # 检查是否在合并区域
-            for (rlo, rhi, clo, chi) in sheet_rb.merged_cells:
-                if clo <= classroom_col_idx < chi and rlo <= row_idx < rhi:
-                    in_merged = True
-                    if row_idx == rlo and classroom_col_idx == clo:
-                        val = sheet_rb.cell_value(rlo, clo).strip()
-                    break
-            if not in_merged:
-                # 普通单元格
-                cell_val = sheet_rb.cell_value(row_idx, classroom_col_idx)
-                val = cell_val.strip() if isinstance(cell_val, str) else str(cell_val).strip()
-                if val == '':
-                    val = None
-
-            if val:
-                classroom_rows.append((row_idx, val))
-
-        print(f"✅ Sheet {sheet_index}: 检测到 {len(classroom_rows)} 个教室")
+        for row_index in range(header_row + 1, sheet_rb.nrows):
+            room = _merged_or_cell_value(sheet_rb, row_index, room_col)
+            if room and room in assignments:
+                sheet_wb.write(row_index, staff_col, _assignment_text(assignments[room]))
+    wb.save(target_path)
+    print(f"[OK] 监考安排已写入: {target_path}")
 
 
-        # 写入监考人员
-        for row_idx, classroom in classroom_rows:
-            if classroom in assignments:
-                proctors = assignments[classroom]
-                proctor_names = [f"{t[1]}" for t in proctors]
-                proctor_str = " ".join(proctor_names)
-                sheet_wb.write(row_idx, proctor_col_idx, proctor_str)
+def _merged_or_cell_value(sheet, row_index, col_index):
+    for rlo, rhi, clo, chi in sheet.merged_cells:
+        if rlo <= row_index < rhi and clo <= col_index < chi:
+            return str(sheet.cell_value(rlo, clo)).strip() if row_index == rlo else ""
+    value = sheet.cell_value(row_index, col_index)
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def parse_room_groups(rules):
+    """解析考场号分组：101-112；201,203,205；C101-C112。"""
+    if isinstance(rules, str):
+        parts = [part.strip() for part in re.split(r"[;；\n]+", rules) if part.strip()]
+    else:
+        parts = [str(part).strip() for part in rules if str(part).strip()]
+    groups = []
+    for part in parts:
+        rooms = []
+        for token in re.split(r"[,，、\s]+", part):
+            if not token:
+                continue
+            match = re.fullmatch(r"([A-Za-z\u4e00-\u9fff]*)(\d+)\s*-\s*([A-Za-z\u4e00-\u9fff]*)(\d+)", token)
+            if match:
+                prefix1, start_text, prefix2, end_text = match.groups()
+                if prefix1 != prefix2:
+                    raise ValueError(f"考场号范围前缀不一致: {token}")
+                start, end = int(start_text), int(end_text)
+                if start > end or end - start > 10000:
+                    raise ValueError(f"考场号范围无效: {token}")
+                width = max(len(start_text), len(end_text))
+                rooms.extend(f"{prefix1}{number:0{width}d}" for number in range(start, end + 1))
             else:
-                print(f"ℹ️ 未分配：{classroom} at row {row_idx}")
+                rooms.append(token)
+        if not rooms:
+            raise ValueError(f"分组规则为空: {part}")
+        groups.append(list(dict.fromkeys(rooms)))
+    if not groups:
+        raise ValueError("请至少输入一条考场分组规则")
+    return groups
 
-    wb.save(input_output_path)
-    print(f"✅ 写入完成：{input_output_path}")
+
+def _load_schedule(input_path, header_row):
+    rb = xlrd.open_workbook(input_path, formatting_info=True)
+    sheet = rb.sheet_by_index(0)
+    headers = sheet.row_values(header_row)
+    room_col = _find_column(headers, ["教室编号", "考场号", "room"])
+    staff_col = _find_column(headers, ["监考人员", "监考教师", "staff", "proctor"])
+    if room_col is None or staff_col is None:
+        raise ValueError("模板中未找到教室编号/考场号或监考人员列")
+
+    records = []
+    previous_room = ""
+    previous_staff = ""
+    for row_index in range(header_row + 1, sheet.nrows):
+        row = list(sheet.row_values(row_index))
+        room = _merged_or_cell_value(sheet, row_index, room_col) or previous_room
+        staff = _merged_or_cell_value(sheet, row_index, staff_col) or previous_staff
+        if room:
+            previous_room = room
+        if staff:
+            previous_staff = staff
+        row[room_col] = room
+        row[staff_col] = staff
+        records.append(row)
+    return rb, sheet, headers, room_col, staff_col, records
+
+
+def _export_styles():
+    """分组表使用与原模板一致的清晰打印样式。"""
+    title = xlwt.easyxf(
+        "font: name 微软雅黑, height 220, bold on;"
+        "align: horiz center, vert center, wrap on"
+    )
+    subtitle = xlwt.easyxf(
+        "font: name 微软雅黑, height 180;"
+        "align: horiz left, vert center, wrap on"
+    )
+    header = xlwt.easyxf(
+        "font: name 微软雅黑, height 180, bold on;"
+        "align: horiz center, vert center, wrap on;"
+        "borders: left thin, right thin, top thin, bottom thin;"
+        "pattern: pattern solid, fore_colour ice_blue"
+    )
+    body = xlwt.easyxf(
+        "font: name 微软雅黑, height 180;"
+        "align: horiz center, vert center, wrap on;"
+        "borders: left thin, right thin, top thin, bottom thin"
+    )
+    note = xlwt.easyxf(
+        "font: name 微软雅黑, height 180, italic on, colour red;"
+        "align: horiz left, vert center"
+    )
+    return title, subtitle, header, body, note
+
+
+def _write_rows(ws, rows, header_row, room_col, staff_col, source_sheet=None):
+    """写入分组表，同时保留模板的标题、表头、列宽、行高和合并结构。"""
+    title, subtitle, header_style, body_style, _ = _export_styles()
+    column_count = max(len(row) for row in rows) if rows else 1
+    if source_sheet is not None:
+        for col_index in range(column_count):
+            info = source_sheet.colinfo_map.get(col_index)
+            ws.col(col_index).width = info.width if info else 2200
+        for row_index in range(len(rows)):
+            info = source_sheet.rowinfo_map.get(row_index)
+            if info and info.height:
+                ws.row(row_index).height = info.height
+
+    header_merges = []
+    if source_sheet is not None:
+        header_merges = [
+            (rlo, rhi, clo, chi)
+            for rlo, rhi, clo, chi in source_sheet.merged_cells
+            if rhi <= header_row + 1
+        ]
+
+    for row_index, row in enumerate(rows):
+        style = title if row_index == 0 else subtitle if row_index < header_row else header_style
+        if row_index > header_row:
+            style = body_style
+        for col_index in range(column_count):
+            if any(rlo <= row_index < rhi and clo <= col_index < chi for rlo, rhi, clo, chi in header_merges):
+                continue
+            if row_index > header_row and col_index in (room_col, staff_col):
+                continue
+            value = row[col_index] if col_index < len(row) else ""
+            ws.write(row_index, col_index, value, style)
+
+    # 标题及表头的合并单元格直接沿用原模板结构。
+    if source_sheet is not None:
+        for rlo, rhi, clo, chi in header_merges:
+            value = rows[rlo][clo] if rlo < len(rows) and clo < len(rows[rlo]) else ""
+            ws.write_merge(rlo, rhi - 1, clo, chi - 1, value, title if rlo == 0 else subtitle if rlo < header_row else header_style)
+
+    data_start = header_row + 1
+    for col_index in (room_col, staff_col):
+        start = 0
+        values = [str(row[col_index]) for row in rows[data_start:]]
+        while start < len(values):
+            end = start
+            while end + 1 < len(values) and values[end + 1] == values[start]:
+                end += 1
+            first_row = data_start + start
+            last_row = data_start + end
+            if values[start]:
+                if first_row == last_row:
+                    ws.write(first_row, col_index, values[start], body_style)
+                else:
+                    ws.write_merge(first_row, last_row, col_index, col_index, values[start], body_style)
+            start = end + 1
+
+
+def split_excel_by_room_groups(input_path, output_path, header_row, rules):
+    """按照考场号范围/列表生成分组 Sheet，并保留标题行和表头。"""
+    groups = parse_room_groups(rules)
+    _, source_sheet, headers, room_col, staff_col, records = _load_schedule(input_path, header_row)
+    workbook = xlwt.Workbook(encoding="utf-8")
+    for index, group in enumerate(groups, start=1):
+        selected = [row for row in records if row[room_col] in set(group)]
+        rows = [source_sheet.row_values(row_index) for row_index in range(header_row + 1)]
+        rows.extend(selected)
+        sheet_name = f"第{index}组"[:31]
+        worksheet = workbook.add_sheet(sheet_name)
+        _write_rows(worksheet, rows, header_row, room_col, staff_col, source_sheet)
+        if not selected:
+            worksheet.write(header_row + 1, 0, f"未找到匹配考场：{','.join(group)}", _export_styles()[-1])
+    workbook.save(output_path)
+    print(f"[OK] 已按考场号导出 {len(groups)} 组: {output_path}")
 
 
 def split_excel_by_serial(input_path, output_path, header_row, sheet_count):
-    rb = xlrd.open_workbook(input_path, formatting_info=True)
-    sheet_rb = rb.sheet_by_index(0)
-
-    header_row = header_row
-    headers = sheet_rb.row_values(header_row)
-
-    room_col_idx = None
-    staff_col_idx = None
-    for idx, col_name in enumerate(headers):
-        if '教室编号' in str(col_name) or 'Room' in str(col_name):
-            room_col_idx = idx
-        elif '监考人员' in str(col_name) or 'Staff' in str(col_name):
-            staff_col_idx = idx
-
-    if room_col_idx is None or staff_col_idx is None:
-        raise ValueError("未找到 '教室编号' 或 '监考人员' 列")
-
-    # 收集有效数据
-    data_rows = []
-    for row_idx in range(header_row + 1, sheet_rb.nrows):
-        row = sheet_rb.row_values(row_idx)
-        try:
-            serial_val = row[0]
-            serial_num = int(serial_val.strip().lstrip('0') or '0')
-        except (ValueError, TypeError):
-            continue
-        data_rows.append((serial_num, row))
-
-    data_rows.sort(key=lambda x: x[0])
-    total = len(data_rows)
-    if total == 0:
-        raise ValueError("无有效数据")
-
-    print(f"✅ 共读取 {total} 行有效数据，准备拆分为 {sheet_count} 个 sheet")
-
-    items_per_sheet = math.ceil(total / sheet_count)
-    wb = xlwt.Workbook(encoding='utf-8')
-
-    for i in range(sheet_count):
-        start_idx = i * items_per_sheet
-        end_idx = min(start_idx + items_per_sheet, total)
-        chunk = data_rows[start_idx:end_idx]
-        if not chunk:
-            continue
-
-        ws = wb.add_sheet(f'Sheet{i + 1}')
-        # 写表头
-        for col, value in enumerate(headers):
-            ws.write(0, col, value)
-
-        # Step 1: 预处理最终值（继承空值）
-        final_rows = []
-        prev_room = ""
-        prev_staff = ""
-        for _, original_row in chunk:
-            row_copy = list(original_row)
-            # 教室
-            room_val = str(original_row[room_col_idx]).strip()
-            if room_val == "":
-                room_val = prev_room
-            else:
-                prev_room = room_val
-            row_copy[room_col_idx] = room_val
-
-            # 监考
-            staff_val = str(original_row[staff_col_idx]).strip()
-            if staff_val == "":
-                staff_val = prev_staff
-            else:
-                prev_staff = staff_val
-            row_copy[staff_col_idx] = staff_val
-
-            final_rows.append(row_copy)
-
-        # Step 2: 写入非合并列（跳过教室和监考）
-        for row_offset, final_row in enumerate(final_rows):
-            for col, cell_value in enumerate(final_row):
-                if col == room_col_idx or col == staff_col_idx:
-                    continue  # 跳过，后面用 merge 写
-                ws.write(row_offset + 1, col, cell_value)
-
-        # Step 3: 构建合并区间（包括单行）
-        def get_all_segments(values):
-            """返回所有连续段，包括单行"""
-            if not values:
-                return []
-            segments = []
-            start = 0
-            for i in range(1, len(values)):
-                if values[i] != values[i - 1]:
-                    segments.append((start, i - 1))
-                    start = i
-            segments.append((start, len(values) - 1))
-            return segments
-
-        room_values = [row[room_col_idx] for row in final_rows]
-        staff_values = [row[staff_col_idx] for row in final_rows]
-
-        room_segments = get_all_segments(room_values)
-        staff_segments = get_all_segments(staff_values)
-
-        # Step 4: 用 write_merge 写所有教室和监考单元格（包括单行）
-        for start, end in room_segments:
-            ws.write_merge(start + 1, end + 1, room_col_idx, room_col_idx, room_values[start])
-        for start, end in staff_segments:
-            ws.write_merge(start + 1, end + 1, staff_col_idx, staff_col_idx, staff_values[start])
-
-    wb.save(output_path)
-    print(f"✅ 拆分并合并完成，已保存至: {output_path}")
+    """兼容旧入口：按原表中的考场顺序平均切组，但不再依赖序号列。"""
+    if sheet_count < 1:
+        raise ValueError("分组数量必须大于0")
+    _, _, _, room_col, _, records = _load_schedule(input_path, header_row)
+    rooms = list(dict.fromkeys(row[room_col] for row in records if row[room_col]))
+    if not rooms:
+        raise ValueError("模板中没有有效考场号")
+    size = (len(rooms) + sheet_count - 1) // sheet_count
+    groups = [rooms[start:start + size] for start in range(0, len(rooms), size)]
+    return split_excel_by_room_groups(input_path, output_path, header_row, groups)
