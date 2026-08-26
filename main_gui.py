@@ -199,6 +199,7 @@ class ProctorArrangerApp(QMainWindow):
         self.table_row_records = []
         self.selected_room = ""
         self.selected_result_row = -1
+        self.removed_proctors = {}
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         main_layout = QVBoxLayout(self.central_widget)
@@ -428,6 +429,7 @@ class ProctorArrangerApp(QMainWindow):
         self.table_row_records = []
         self.selected_room = ""
         self.selected_result_row = -1
+        self.removed_proctors = {}
         self.btn_export.setEnabled(False)
         self.btn_split.setEnabled(False)
         self.btn_add_person.setEnabled(False)
@@ -748,33 +750,63 @@ class ProctorArrangerApp(QMainWindow):
             QMessageBox.information(self, "提示", "请先点击一个考场。")
             return
         current_session = self.schedule_results[self.current_session_id]["session"]
-        assigned_ids = {
+        current_formal_ids = {
             teacher[0]
             for room_teachers in self.assignments.values()
             for teacher in room_teachers
         }
-        blocked_ids = set(assigned_ids)
-        # 本场次的备选和其他重叠场次的正式/备选教师，都不能通过“增添”重复占用。
+        formal_locations = {}
+        backup_locations = {}
+        removed_key = (self.current_session_id, self.selected_room)
+        removed_teachers = self.removed_proctors.get(removed_key, {})
+        removed_ids = set(removed_teachers)
         for session_id, result in self.schedule_results.items():
-            if session_id == self.current_session_id:
-                blocked_ids.update(
-                    teacher[0]
-                    for room_teachers in result["backups"].values()
-                    for teacher in room_teachers
-                )
+            overlaps = session_id == self.current_session_id or periods_overlap(
+                current_session, result["session"]
+            )
+            for other_room, room_teachers in result["assignments"].items():
+                for teacher in room_teachers:
+                    formal_locations.setdefault(teacher[0], []).append({
+                        "session_id": session_id, "room": other_room, "overlap": overlaps
+                    })
+            for other_room, room_teachers in result["backups"].items():
+                for teacher in room_teachers:
+                    backup_locations.setdefault(teacher[0], []).append({
+                        "session_id": session_id, "room": other_room, "overlap": overlaps
+                    })
+
+        candidates = []
+        for teacher in self.teacher_pool:
+            teacher_id = teacher[0]
+            if teacher_id in current_formal_ids:
                 continue
-            if periods_overlap(current_session, result["session"]):
-                blocked_ids.update(
-                    teacher[0]
-                    for room_teachers in result["assignments"].values()
-                    for teacher in room_teachers
-                )
-                blocked_ids.update(
-                    teacher[0]
-                    for room_teachers in result["backups"].values()
-                    for teacher in room_teachers
-                )
-        available = [teacher for teacher in self.teacher_pool if teacher[0] not in blocked_ids]
+            formal_conflict = any(
+                location["overlap"] for location in formal_locations.get(teacher_id, [])
+            )
+            if formal_conflict:
+                continue
+            backups = backup_locations.get(teacher_id, [])
+            if any(
+                item["session_id"] == self.current_session_id
+                and item["room"] == self.selected_room
+                for item in backups
+            ):
+                priority = 0  # 当前考场备选
+                tag = "当前考场备选"
+            elif teacher_id in removed_ids:
+                priority = 1  # 曾从当前考场删除
+                tag = "之前删除，可恢复原位"
+            elif backups:
+                priority = 2  # 其他考场备选
+                tag = "其他考场备选"
+            elif not formal_locations.get(teacher_id):
+                priority = 3  # 完全空闲
+                tag = "空闲教师"
+            else:
+                priority = 4  # 非重叠时段正式监考
+                tag = "非重叠时段"
+            candidates.append((priority, teacher[1], teacher, backups, tag))
+        candidates.sort(key=lambda item: (item[0], item[1]))
         required = self.room_requirements.get(self.selected_room)
         current = self.assignments[self.selected_room]
         if required and len(current) >= required:
@@ -787,23 +819,36 @@ class ProctorArrangerApp(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
 
-        if not available:
+        if not candidates:
             QMessageBox.information(
                 self,
                 "无法添加",
-                "当前时间段没有空闲教师可添加。\n"
-                "其他重叠场次正在监考或备选的教师不能重复安排；"
-                "如需调换，请使用“更换选中人员”。",
+                "当前没有符合规则的教师可添加。\n"
+                "请检查同一时间段的正式监考和备选安排。",
             )
             return
-        candidates = available
-        choices = [f"{teacher[1]}（{teacher[0]}）｜{teacher[4]}" for teacher in candidates]
+        choices = [
+            f"[{item[4]}] {item[2][1]}（{item[2][0]}）｜{item[2][4]}"
+            for item in candidates
+        ]
         choice, ok = self.choose_teacher(
             "添加监考人员", f"选择要添加到 {self.selected_room} 的教师：", choices
         )
         if not ok:
             return
-        selected = candidates[choices.index(choice)]
+        selected_item = candidates[choices.index(choice)]
+        selected = selected_item[2]
+        # 被选中的备选教师从原备选位置移除，随后由 refresh_backups 补齐空出的名额。
+        for location in selected_item[3]:
+            source = self.schedule_results[location["session_id"]]["backups"]
+            source[location["room"]] = [
+                teacher for teacher in source[location["room"]]
+                if teacher[0] != selected[0]
+            ]
+        if selected[0] in removed_teachers:
+            del removed_teachers[selected[0]]
+            if not removed_teachers:
+                self.removed_proctors.pop(removed_key, None)
         changed_room = self.selected_room
         changed_session = self.current_session_id
         current.append(selected)
@@ -860,6 +905,15 @@ class ProctorArrangerApp(QMainWindow):
                 for location in locations.get(teacher[0], [])
             )
         ]
+        def candidate_priority(teacher):
+            teacher_locations = locations.get(teacher[0], [])
+            if not teacher_locations:
+                return 0  # 完全空闲
+            if not any(location["overlap"] for location in teacher_locations):
+                return 1  # 仅在非重叠时段有任务
+            return 2  # 存在时间冲突
+
+        candidates.sort(key=lambda teacher: (candidate_priority(teacher), teacher[1]))
         if not candidates:
             QMessageBox.information(self, "无法更换", "没有可用的替换教师。")
             return
@@ -938,6 +992,7 @@ class ProctorArrangerApp(QMainWindow):
         changed_room = room
         deleted_name = teacher[1]
         del self.assignments[room][teacher_index]
+        self.removed_proctors.setdefault((changed_session, changed_room), {})[teacher[0]] = teacher
         # 删除的教师保持空闲，不因备选刷新而自动流转到其他考场。
         self.refresh_backups(excluded_ids={teacher[0]})
         self.refresh_current_report()
