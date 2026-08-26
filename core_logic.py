@@ -333,8 +333,10 @@ def build_workload_stats(session_results, teachers):
     return workload
 
 
-def rebuild_session_backups(session_results, session_id, teachers, weights=None, backup_count=2):
-    """人工调整某一场次后，按时间冲突重新计算该场次的备选教师。"""
+def rebuild_session_backups(
+    session_results, session_id, teachers, weights=None, backup_count=2, excluded_ids=None
+):
+    """人工调整后保留原备选，只补缺口，避免其他考场名单无故洗牌。"""
     if session_id not in session_results:
         raise ValueError(f"未知考试场次: {session_id}")
     target = session_results[session_id]
@@ -353,20 +355,39 @@ def rebuild_session_backups(session_results, session_id, teachers, weights=None,
             for room_teachers in other["backups"].values()
             for teacher in room_teachers
         )
+    excluded_ids = set(excluded_ids or ())
     current_ids = {
         teacher[0]
         for room_teachers in target["assignments"].values()
         for teacher in room_teachers
     }
+    teacher_map = {teacher[0]: teacher for teacher in teachers}
+    used_ids = blocked_ids | current_ids | excluded_ids
+    rooms = _room_records(target["session"]["rooms"])
+    backups = {room: [] for room, _ in rooms}
+    for room in backups:
+        for teacher in target.get("backups", {}).get(room, []):
+            if teacher[0] in teacher_map and teacher[0] not in used_ids:
+                backups[room].append(teacher_map[teacher[0]])
+                used_ids.add(teacher[0])
     available = {
         teacher[0]: teacher
         for teacher in teachers
-        if teacher[0] not in blocked_ids and teacher[0] not in current_ids
+        if teacher[0] not in used_ids
     }
-    rooms = _room_records(target["session"]["rooms"])
-    backups, _ = _build_session_backups(
-        rooms, target["assignments"], available, weights, backup_count
-    )
+    for room, _ in rooms:
+        current = target["assignments"].get(room, [])
+        while len(backups[room]) < max(0, int(backup_count)) and available:
+            best_score = max(
+                _score_teacher(teacher, current, weights)
+                for teacher in available.values()
+            )
+            selected = next(
+                teacher for teacher in available.values()
+                if _score_teacher(teacher, current, weights) == best_score
+            )
+            backups[room].append(selected)
+            del available[selected[0]]
     target["backups"] = backups
     return backups
 

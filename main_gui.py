@@ -658,7 +658,7 @@ class ProctorArrangerApp(QMainWindow):
         layout.addWidget(table)
         dialog.exec_()
 
-    def refresh_backups(self):
+    def refresh_backups(self, excluded_ids=None):
         if not self.current_session_id or not self.schedule_results:
             return
         for session_id in self.schedule_results:
@@ -668,6 +668,7 @@ class ProctorArrangerApp(QMainWindow):
                 self.teacher_pool,
                 preference_weights(self.preference_combo.currentData()),
                 backup_count=2,
+                excluded_ids=excluded_ids if session_id == self.current_session_id else None,
             )
         self.backup_assignments = self.schedule_results[self.current_session_id]["backups"]
         self.workload = build_workload_stats(self.schedule_results, self.teacher_pool)
@@ -937,7 +938,8 @@ class ProctorArrangerApp(QMainWindow):
         changed_room = room
         deleted_name = teacher[1]
         del self.assignments[room][teacher_index]
-        self.refresh_backups()
+        # 删除的教师保持空闲，不因备选刷新而自动流转到其他考场。
+        self.refresh_backups(excluded_ids={teacher[0]})
         self.refresh_current_report()
         self.display_results_with_merge(self.assignments)
         self.append_log(
