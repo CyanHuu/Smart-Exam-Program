@@ -6,6 +6,8 @@
 
 import random
 
+from schedule_loader import periods_overlap
+
 
 PREFERENCE_WEIGHTS = {
     "default": {"experience": 60, "gender": 25, "department": 15},
@@ -189,6 +191,183 @@ def build_backup_assignments(classroom_data, teachers, assignments, weights=None
             selected = candidates[0]
             backups[room].append(selected)
             del available[selected[0]]
+    return backups
+
+
+def _assign_one_session(rooms, teachers, blocked_ids, weights, rng):
+    """在一个时间段内排考；blocked_ids来自时间重叠的其他场次。"""
+    available = {
+        teacher[0]: teacher
+        for teacher in teachers
+        if teacher[0] not in blocked_ids
+    }
+    assignments = {room: [] for room, _ in rooms}
+    warnings = []
+    for room, _ in rooms:
+        experienced = [teacher for teacher in available.values() if teacher[2] == 1]
+        candidates = experienced or list(available.values())
+        if not candidates:
+            warnings.append(f"考场 {room} 无可用教师，无法安排第一监考")
+            continue
+        best_score = max(_score_teacher(teacher, [], weights) for teacher in candidates)
+        tied = [teacher for teacher in candidates if _score_teacher(teacher, [], weights) == best_score]
+        selected = rng.choice(tied)
+        assignments[room].append(selected)
+        del available[selected[0]]
+        if not experienced:
+            warnings.append(f"考场 {room} 未能安排有经验的第一监考")
+
+    for room, needed in rooms:
+        current = assignments[room]
+        while len(current) < needed and available:
+            scores = {
+                teacher[0]: _score_teacher(teacher, current, weights)
+                for teacher in available.values()
+            }
+            best_score = max(scores.values())
+            tied = [teacher for teacher in available.values() if scores[teacher[0]] == best_score]
+            selected = rng.choice(tied)
+            current.append(selected)
+            del available[selected[0]]
+        if len(current) < needed:
+            warnings.append(f"考场 {room} 缺少 {needed - len(current)} 名监考教师")
+    return assignments, available, warnings
+
+
+def _build_session_backups(rooms, assignments, available, weights, backup_count):
+    """从本场次剩余教师中分配唯一备选，避免备选同时服务多个考场。"""
+    backups = {room: [] for room, _ in rooms}
+    reserve = dict(available)
+    for room, _ in rooms:
+        current = assignments[room]
+        for _ in range(max(0, int(backup_count))):
+            if not reserve:
+                break
+            best_score = max(_score_teacher(teacher, current, weights) for teacher in reserve.values())
+            candidates = [teacher for teacher in reserve.values() if _score_teacher(teacher, current, weights) == best_score]
+            selected = candidates[0]
+            backups[room].append(selected)
+            del reserve[selected[0]]
+    return backups, reserve
+
+
+def assign_exam_sessions(sessions, teacher_df, weights=None, backup_count=2, random_seed=None):
+    """按多个考试时间段排考，并返回场次结果、备选结果和教师工作量。"""
+    if not sessions:
+        raise ValueError("考试场次为空")
+    teachers = _teacher_records(teacher_df)
+    weights = _normalise_weights(weights)
+    rng = random.Random(random_seed)
+    ordered = sorted(sessions, key=lambda session: session["start"])
+    results = {}
+
+    for session in ordered:
+        rooms = _room_records(session["rooms"])
+        blocked_ids = set()
+        for previous in results.values():
+            if periods_overlap(session, previous["session"]):
+                blocked_ids.update(
+                    teacher[0]
+                    for room_teachers in previous["assignments"].values()
+                    for teacher in room_teachers
+                )
+                blocked_ids.update(
+                    teacher[0]
+                    for room_teachers in previous["backups"].values()
+                    for teacher in room_teachers
+                )
+        assignments, available, warnings = _assign_one_session(
+            rooms, teachers, blocked_ids, weights, rng
+        )
+        backups, reserve = _build_session_backups(
+            rooms, assignments, available, weights, backup_count
+        )
+        report = _build_report(rooms, assignments, teachers, reserve, warnings)
+        report["backup_total"] = sum(len(items) for items in backups.values())
+        report["backup_shortage"] = sum(
+            max(0, backup_count - len(items)) for items in backups.values()
+        )
+        results[session["session_id"]] = {
+            "session": session,
+            "assignments": assignments,
+            "backups": backups,
+            "report": report,
+        }
+
+    workload = build_workload_stats(results, teachers)
+    return results, workload
+
+
+def build_workload_stats(session_results, teachers):
+    """统计正式监考、备选待命和总任务量。"""
+    workload = {
+        teacher[0]: {
+            "teacher_id": teacher[0],
+            "name": teacher[1],
+            "formal_count": 0,
+            "backup_count": 0,
+            "total_count": 0,
+            "sessions": [],
+        }
+        for teacher in teachers
+    }
+    for result in session_results.values():
+        session = result["session"]
+        label = f"{session['session_id']} {session['start']:%Y-%m-%d %H:%M}-{session['end']:%H:%M}"
+        for room, room_teachers in result["assignments"].items():
+            for teacher in room_teachers:
+                item = workload[teacher[0]]
+                item["formal_count"] += 1
+                item["total_count"] += 1
+                item["sessions"].append(
+                    {"session": label, "room": room, "role": "正式监考"}
+                )
+        for room, room_teachers in result["backups"].items():
+            for teacher in room_teachers:
+                item = workload[teacher[0]]
+                item["backup_count"] += 1
+                item["total_count"] += 1
+                item["sessions"].append(
+                    {"session": label, "room": room, "role": "备选监考"}
+                )
+    return workload
+
+
+def rebuild_session_backups(session_results, session_id, teachers, weights=None, backup_count=2):
+    """人工调整某一场次后，按时间冲突重新计算该场次的备选教师。"""
+    if session_id not in session_results:
+        raise ValueError(f"未知考试场次: {session_id}")
+    target = session_results[session_id]
+    weights = _normalise_weights(weights)
+    blocked_ids = set()
+    for other_id, other in session_results.items():
+        if other_id == session_id or not periods_overlap(target["session"], other["session"]):
+            continue
+        blocked_ids.update(
+            teacher[0]
+            for room_teachers in other["assignments"].values()
+            for teacher in room_teachers
+        )
+        blocked_ids.update(
+            teacher[0]
+            for room_teachers in other["backups"].values()
+            for teacher in room_teachers
+        )
+    current_ids = {
+        teacher[0]
+        for room_teachers in target["assignments"].values()
+        for teacher in room_teachers
+    }
+    available = {
+        teacher[0]: teacher
+        for teacher in teachers
+        if teacher[0] not in blocked_ids and teacher[0] not in current_ids
+    }
+    rooms = _room_records(target["session"]["rooms"])
+    backups, _ = _build_session_backups(
+        rooms, target["assignments"], available, weights, backup_count
+    )
+    target["backups"] = backups
     return backups
 
 

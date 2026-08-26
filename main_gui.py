@@ -8,24 +8,28 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QTextEdit, QHeaderView, QSplitter, QComboBox,
-    QInputDialog, QDialog, QSizePolicy, QDialogButtonBox
+    QInputDialog, QDialog, QSizePolicy, QDialogButtonBox, QLineEdit, QCheckBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMutex
-from PyQt5.QtGui import QBrush, QColor, QFont, QTextCursor
+from PyQt5.QtGui import QBrush, QColor, QFont, QTextCursor, QTextOption
 
 # 导入核心逻辑
 sys.path.append(str(Path(__file__).parent))
 from core_logic import (
-    assign_proctors,
-    build_backup_assignments,
+    assign_exam_sessions,
+    build_workload_stats,
     preference_weights,
+    rebuild_session_backups,
     _teacher_records,
 )
 from classroom_2 import get_classroom_info
 from examiner import analyze_teacher_list
+from schedule_loader import load_exam_sessions, periods_overlap
 from outputTask import (
     get_schedule_rooms,
+    split_schedule_by_room_groups,
     write_assignments_to_excel,
+    write_session_assignments_to_excel,
     split_excel_by_room_groups,
 )
 
@@ -51,14 +55,17 @@ class WorkerSignals(QObject):
 
 # ====== 后台工作类 ======
 class ArrangementWorker:
-    def __init__(self, classroom_path, examiner_path, weights):
+    def __init__(self, classroom_path, examiner_path, schedule_path, weights):
         self.classroom_path = classroom_path
         self.examiner_path = examiner_path
+        self.schedule_path = schedule_path
         self.weights = weights
         self.signals = WorkerSignals()
         self.report = {}
         self.teacher_pool = []
         self.classroom_data = []
+        self.schedule_results = {}
+        self.workload = {}
 
     def run(self):
         # 重定向 print 到日志
@@ -71,13 +78,36 @@ class ArrangementWorker:
             teacher_df = analyze_teacher_list(self.examiner_path)
             self.classroom_data = classroom_data
             self.teacher_pool = _teacher_records(teacher_df)
-            assignments, self.report = assign_proctors(
-                classroom_data, teacher_df, weights=self.weights, return_report=True
+            sessions = load_exam_sessions(self.schedule_path, classroom_data)
+            self.schedule_results, self.workload = assign_exam_sessions(
+                sessions, teacher_df, weights=self.weights, backup_count=2, random_seed=7
             )
-            self.backup_assignments = build_backup_assignments(
-                classroom_data, self.teacher_pool, assignments, self.weights, backup_count=2
-            )
-            self.signals.finished.emit(assignments, "")
+            # 多场次排考不会自动调用旧版单场次报告，这里输出适合右侧窄面板的日志。
+            print("\n" + "=" * 26)
+            print("【多场次排考完成】")
+            print("=" * 26)
+            for session_id, result in self.schedule_results.items():
+                session = result["session"]
+                report = result["report"]
+                print(f"\n【场次 {session_id}】")
+                print(f"时间：{session['period_text']}")
+                print(f"考场：{report['total_rooms']} 个")
+                print(f"需求：{report['total_needed']} 人")
+                print(f"安排：{report['total_assigned']} 人")
+                print(f"缺口：{report['shortage']} 人")
+                print(
+                    "规则：经验 "
+                    f"{report['experience_first_count']}/{report['total_rooms']}，"
+                    f"男女 {report['gender_mix_count']}/{report['total_rooms']}，"
+                    f"部门 {report['department_mix_count']}/{report['total_rooms']}"
+                )
+                backup_total = sum(len(items) for items in result["backups"].values())
+                print(f"备选：{backup_total} 人")
+                for warning in report.get("warnings", []):
+                    print(f"提醒：{warning}")
+            print(f"\n【教师工作量】已统计 {len(self.workload)} 名教师")
+            print("=" * 26 + "\n")
+            self.signals.finished.emit(self.schedule_results, "")
         except Exception as e:
             import traceback
             error_msg = str(e)
@@ -123,6 +153,9 @@ class ProctorArrangerApp(QMainWindow):
         self.setWindowTitle("浙水院监考安排系统for朱巍")
         self.resize(1200, 800)  # 更合理的初始大小
         self.assignments = None
+        self.schedule_results = {}
+        self.workload = {}
+        self.current_session_id = ""
         self.teacher_pool = []
         self.room_requirements = {}
         self.backup_assignments = {}
@@ -151,6 +184,13 @@ class ProctorArrangerApp(QMainWindow):
         teacher_hbox.addWidget(self.btn_select_teacher)
         teacher_hbox.addWidget(self.label_teacher)
 
+        schedule_hbox = QHBoxLayout()
+        self.btn_select_schedule = QPushButton("选择3.考试安排模板")
+        self.btn_select_schedule.clicked.connect(self.select_schedule)
+        self.label_schedule = QLabel("未选择")
+        schedule_hbox.addWidget(self.btn_select_schedule)
+        schedule_hbox.addWidget(self.label_schedule)
+
         self.btn_run = QPushButton("立即安排")
         self.btn_run.setStyleSheet(button_style)
         self.btn_run.clicked.connect(self.run_arrangement)
@@ -161,6 +201,7 @@ class ProctorArrangerApp(QMainWindow):
 
         control_layout.addLayout(room_hbox)
         control_layout.addLayout(teacher_hbox)
+        control_layout.addLayout(schedule_hbox)
 
         preference_hbox = QHBoxLayout()
         preference_hbox.addWidget(QLabel("排考偏好"))
@@ -177,6 +218,13 @@ class ProctorArrangerApp(QMainWindow):
         self.preference_combo.setToolTip("选择规则侧重点，系统会自动处理内部评分")
         preference_hbox.addWidget(self.preference_combo, 1)
         control_layout.addLayout(preference_hbox)
+        session_hbox = QHBoxLayout()
+        session_hbox.addWidget(QLabel("当前考试场次"))
+        self.session_combo = QComboBox()
+        self.session_combo.currentIndexChanged.connect(self.display_current_session)
+        self.session_combo.setEnabled(False)
+        session_hbox.addWidget(self.session_combo, 1)
+        control_layout.addLayout(session_hbox)
         control_layout.addWidget(self.btn_run)
         control_layout.addWidget(self.status_label)
 
@@ -202,15 +250,19 @@ class ProctorArrangerApp(QMainWindow):
         # 日志区域
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Microsoft YaHei UI", 11))
+        log_font = QFont("Microsoft YaHei UI", 9)
+        log_font.setStyleHint(QFont.SansSerif)
+        self.log_text.setFont(log_font)
         self.log_text.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.log_text.setMinimumWidth(280)
+        self.log_text.setWordWrapMode(QTextOption.WrapAnywhere)
+        self.log_text.setMinimumSize(330, 180)
+        self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_text.setStyleSheet("""
             background-color: #252525;
             color: #e0e0e0;
             border: 1px solid #555;
             border-radius: 6px;
-            padding: 8px;
+            padding: 6px;
         """)
         log_panel = QWidget()
         log_panel_layout = QVBoxLayout(log_panel)
@@ -219,9 +271,9 @@ class ProctorArrangerApp(QMainWindow):
         log_panel_layout.addWidget(self.log_title)
         log_panel_layout.addWidget(self.log_text)
         splitter.addWidget(log_panel)
-        splitter.setSizes([850, 350])  # 左侧结果表，右侧运行日志
+        splitter.setSizes([780, 420])  # 左侧结果表，右侧运行日志
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(1, 1)
 
         # 导出按钮
         export_layout = QHBoxLayout()
@@ -240,19 +292,24 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_add_person = QPushButton("给选中考场增添人员")
         self.btn_delete_person = QPushButton("删除选中人员")
         self.btn_replace_person = QPushButton("更换选中人员")
+        self.btn_workload = QPushButton("查看教师工作量")
         self.btn_add_person.setStyleSheet(button_style)
         self.btn_delete_person.setStyleSheet(button_style)
         self.btn_replace_person.setStyleSheet(button_style)
+        self.btn_workload.setStyleSheet(button_style)
         self.btn_add_person.clicked.connect(self.add_person_to_room)
         self.btn_delete_person.clicked.connect(self.delete_person_from_room)
         self.btn_replace_person.clicked.connect(self.replace_person_in_room)
+        self.btn_workload.clicked.connect(self.show_workload)
         self.btn_add_person.setEnabled(False)
         self.btn_delete_person.setEnabled(False)
         self.btn_replace_person.setEnabled(False)
+        self.btn_workload.setEnabled(False)
         self.selected_room_label = QLabel("请先点击安排结果中的考场或教师")
         edit_layout.addWidget(self.btn_add_person)
         edit_layout.addWidget(self.btn_delete_person)
         edit_layout.addWidget(self.btn_replace_person)
+        edit_layout.addWidget(self.btn_workload)
         edit_layout.addWidget(self.selected_room_label, 1)
 
         # 组装布局
@@ -276,18 +333,33 @@ class ProctorArrangerApp(QMainWindow):
             self.label_teacher.setText(os.path.basename(path))
             self.update_ready()
 
+    def select_schedule(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择考试安排模板", "", "Excel Files (*.xls *.xlsx)"
+        )
+        if path:
+            self.schedule_path = path
+            self.label_schedule.setText(os.path.basename(path))
+            self.update_ready()
+
     def update_ready(self):
-        ready = hasattr(self, 'classroom_path') and hasattr(self, 'examiner_path')
+        ready = all(
+            hasattr(self, name)
+            for name in ("classroom_path", "examiner_path", "schedule_path")
+        )
         self.btn_run.setEnabled(ready)
 
     def run_arrangement(self):
         self.log_text.clear()
         self.log_text.show()
         self.log_title.show()
-        self.result_splitter.setSizes([850, 350])
+        self.result_splitter.setSizes([780, 420])
         self.status_label.setText("正在安排中，请等待~")
         self.result_table.setRowCount(0)
         self.assignments = None
+        self.schedule_results = {}
+        self.workload = {}
+        self.current_session_id = ""
         self.teacher_pool = []
         self.room_requirements = {}
         self.backup_assignments = {}
@@ -299,10 +371,15 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_add_person.setEnabled(False)
         self.btn_delete_person.setEnabled(False)
         self.btn_replace_person.setEnabled(False)
+        self.btn_workload.setEnabled(False)
+        self.session_combo.clear()
+        self.session_combo.setEnabled(False)
         QApplication.processEvents()
 
         weights = preference_weights(self.preference_combo.currentData())
-        self.worker = ArrangementWorker(self.classroom_path, self.examiner_path, weights)
+        self.worker = ArrangementWorker(
+            self.classroom_path, self.examiner_path, self.schedule_path, weights
+        )
         self.worker.signals.finished.connect(self.on_finished)
         self.worker.signals.log_message.connect(self.append_log)
         thread = threading.Thread(target=self.worker.run)
@@ -314,8 +391,8 @@ class ProctorArrangerApp(QMainWindow):
         self.log_text.insertPlainText(msg)
         self.log_text.ensureCursorVisible()
 
-    def on_finished(self, assignments, error):
-        if error or assignments is None:
+    def on_finished(self, schedule_results, error):
+        if error or schedule_results is None:
             self.log_text.show()
             self.log_title.show()
             self.result_splitter.setSizes([650, 550])
@@ -324,24 +401,55 @@ class ProctorArrangerApp(QMainWindow):
             self.status_label.setStyleSheet("color: #ff4444; font-weight: bold; font-size: 14pt;")
             return
 
-        self.assignments = assignments
-        self.report = getattr(self.worker, "report", {})
+        self.schedule_results = schedule_results
+        self.workload = getattr(self.worker, "workload", {})
         self.teacher_pool = getattr(self.worker, "teacher_pool", [])
-        self.room_requirements = dict(getattr(self.worker, "classroom_data", []))
-        self.backup_assignments = getattr(self.worker, "backup_assignments", {})
+        self.session_combo.blockSignals(True)
+        self.session_combo.clear()
+        for session_id, result in self.schedule_results.items():
+            session = result["session"]
+            label = f"{session_id}｜{session['period_text']}"
+            self.session_combo.addItem(label, session_id)
+        self.session_combo.blockSignals(False)
+        self.session_combo.setEnabled(bool(self.schedule_results))
+        self.report = self._combined_report()
         self.status_label.setText(
-            f"✅ 排考完成：{self.report.get('total_rooms', 0)} 个考场，"
+            f"✅ 排考完成：{self.report.get('total_sessions', 0)} 个场次，"
+            f"{self.report.get('total_rooms', 0)} 个考场，"
             f"已安排 {self.report.get('total_assigned', 0)} 人，"
             f"缺口 {self.report.get('shortage', 0)} 人"
         )
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
-        self.display_results_with_merge(assignments)
+        if self.schedule_results:
+            self.session_combo.setCurrentIndex(0)
+            self.display_current_session()
         # 成功后保留日志框，避免界面留下空白区域；结果表仍占主要空间。
         self.log_text.show()
         self.log_title.show()
-        self.result_splitter.setSizes([850, 350])
+        self.result_splitter.setSizes([780, 420])
         self.btn_export.setEnabled(True)
         self.btn_split.setEnabled(True)
+        self.btn_workload.setEnabled(True)
+
+    def _combined_report(self):
+        reports = [result["report"] for result in self.schedule_results.values()]
+        return {
+            "total_sessions": len(reports),
+            "total_rooms": sum(report.get("total_rooms", 0) for report in reports),
+            "total_assigned": sum(report.get("total_assigned", 0) for report in reports),
+            "shortage": sum(report.get("shortage", 0) for report in reports),
+        }
+
+    def display_current_session(self):
+        session_id = self.session_combo.currentData()
+        if not session_id or session_id not in self.schedule_results:
+            return
+        self.current_session_id = session_id
+        result = self.schedule_results[session_id]
+        self.assignments = result["assignments"]
+        self.backup_assignments = result["backups"]
+        self.room_requirements = dict(result["session"]["rooms"])
+        self.display_results_with_merge(self.assignments)
 
     def select_result_row(self, row, _column):
         """点击任意结果行，选中该行所属考场。"""
@@ -357,14 +465,109 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_delete_person.setEnabled(teacher_index is not None)
         self.btn_replace_person.setEnabled(teacher_index is not None)
 
-    def refresh_backups(self):
-        self.backup_assignments = build_backup_assignments(
-            list(self.room_requirements.items()),
-            self.teacher_pool,
-            self.assignments,
-            preference_weights(self.preference_combo.currentData()),
-            backup_count=2,
+    def show_workload(self):
+        if not self.workload:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("教师工作量统计")
+        dialog.resize(1080, 620)
+        layout = QVBoxLayout(dialog)
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("查找教师："))
+        search_box = QLineEdit(dialog)
+        search_box.setPlaceholderText("输入姓名、工号、场次或考场号")
+        search_box.setClearButtonEnabled(True)
+        filter_layout.addWidget(search_box, 1)
+        show_assigned_only = QCheckBox("仅显示有任务教师", dialog)
+        show_assigned_only.setChecked(True)
+        show_assigned_only.setToolTip("取消勾选后显示所有教师，包括总任务量为 0 的教师")
+        filter_layout.addWidget(show_assigned_only)
+        layout.addLayout(filter_layout)
+        summary_label = QLabel(dialog)
+        layout.addWidget(summary_label)
+        table = QTableWidget(dialog)
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels([
+            "教师姓名", "工号", "正式监考", "备选待命", "总任务量", "任务明细（场次｜时间｜考场）"
+        ])
+        table.setAlternatingRowColors(True)
+        table.setWordWrap(True)
+        table.setTextElideMode(Qt.ElideNone)
+        table.setStyleSheet(
+            "QHeaderView::section { background: #4a79a5; color: white; "
+            "font-weight: bold; padding: 6px; }"
         )
+        rows = sorted(
+            self.workload.values(),
+            key=lambda item: (-item["total_count"], item["name"]),
+        )
+        header = table.horizontalHeader()
+        for column in (0, 1, 2, 3, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        table.setColumnWidth(5, 620)
+
+        def refresh_table():
+            keyword = search_box.text().strip().lower()
+            filtered = []
+            for item in rows:
+                if show_assigned_only.isChecked() and item["total_count"] == 0:
+                    continue
+                searchable = " ".join([
+                    str(item["name"]), str(item["teacher_id"]),
+                    *[
+                        f"{task['session']} {task.get('room', '')} {task['role']}"
+                        for task in item["sessions"]
+                    ],
+                ]).lower()
+                if keyword and keyword not in searchable:
+                    continue
+                filtered.append(item)
+
+            table.setRowCount(len(filtered))
+            for row_index, item in enumerate(filtered):
+                values = [
+                    item["name"], item["teacher_id"], str(item["formal_count"]),
+                    str(item["backup_count"]), str(item["total_count"]),
+                ]
+                for column, value in enumerate(values):
+                    cell = QTableWidgetItem(value)
+                    if column in (1, 2, 3, 4):
+                        cell.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(row_index, column, cell)
+                details = "\n".join(
+                    f"{task['role'].replace('监考', '')}｜{task['session']}｜考场 {task.get('room', '未标明')}"
+                    for task in item["sessions"]
+                ) or "暂无任务"
+                detail_cell = QTableWidgetItem(details)
+                detail_cell.setToolTip(details)
+                table.setItem(row_index, 5, detail_cell)
+                table.setRowHeight(row_index, max(42, 24 * details.count("\n") + 18))
+            hidden = len(rows) - len(filtered)
+            hint = f"已隐藏 {hidden} 名无任务教师" if hidden else "当前没有无任务教师"
+            summary_label.setText(
+                f"显示 {len(filtered)} / {len(rows)} 名教师　｜　{hint}"
+            )
+
+        search_box.textChanged.connect(refresh_table)
+        show_assigned_only.toggled.connect(lambda _checked: refresh_table())
+        refresh_table()
+        layout.addWidget(table)
+        dialog.exec_()
+
+    def refresh_backups(self):
+        if not self.current_session_id or not self.schedule_results:
+            return
+        for session_id in self.schedule_results:
+            rebuild_session_backups(
+                self.schedule_results,
+                session_id,
+                self.teacher_pool,
+                preference_weights(self.preference_combo.currentData()),
+                backup_count=2,
+            )
+        self.backup_assignments = self.schedule_results[self.current_session_id]["backups"]
+        self.workload = build_workload_stats(self.schedule_results, self.teacher_pool)
 
     def choose_teacher(self, title, prompt, choices):
         """使用较大的选择窗口，避免教师信息被省略号截断。"""
@@ -381,12 +584,34 @@ class ProctorArrangerApp(QMainWindow):
         if not self.assignments or not self.selected_room:
             QMessageBox.information(self, "提示", "请先点击一个考场。")
             return
+        current_session = self.schedule_results[self.current_session_id]["session"]
         assigned_ids = {
             teacher[0]
             for room_teachers in self.assignments.values()
             for teacher in room_teachers
         }
-        available = [teacher for teacher in self.teacher_pool if teacher[0] not in assigned_ids]
+        blocked_ids = set(assigned_ids)
+        # 本场次的备选和其他重叠场次的正式/备选教师，都不能通过“增添”重复占用。
+        for session_id, result in self.schedule_results.items():
+            if session_id == self.current_session_id:
+                blocked_ids.update(
+                    teacher[0]
+                    for room_teachers in result["backups"].values()
+                    for teacher in room_teachers
+                )
+                continue
+            if periods_overlap(current_session, result["session"]):
+                blocked_ids.update(
+                    teacher[0]
+                    for room_teachers in result["assignments"].values()
+                    for teacher in room_teachers
+                )
+                blocked_ids.update(
+                    teacher[0]
+                    for room_teachers in result["backups"].values()
+                    for teacher in room_teachers
+                )
+        available = [teacher for teacher in self.teacher_pool if teacher[0] not in blocked_ids]
         required = self.room_requirements.get(self.selected_room)
         current = self.assignments[self.selected_room]
         if required and len(current) >= required:
@@ -403,8 +628,8 @@ class ProctorArrangerApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "无法添加",
-                "当前没有空闲教师可添加。\n"
-                "其他考场正在监考的教师不能通过“增添人员”重复安排；"
+                "当前时间段没有空闲教师可添加。\n"
+                "其他重叠场次正在监考或备选的教师不能重复安排；"
                 "如需调换，请使用“更换选中人员”。",
             )
             return
@@ -433,22 +658,50 @@ class ProctorArrangerApp(QMainWindow):
             return
 
         target = self.assignments[room][teacher_index]
-        assigned_rooms = {
-            teacher[0]: other_room
-            for other_room, room_teachers in self.assignments.items()
-            for teacher in room_teachers
-        }
+        current_session = self.schedule_results[self.current_session_id]["session"]
+        locations = {}
+        for session_id, result in self.schedule_results.items():
+            session = result["session"]
+            overlaps = session_id == self.current_session_id or periods_overlap(current_session, session)
+            for other_room, room_teachers in result["assignments"].items():
+                for teacher in room_teachers:
+                    locations.setdefault(teacher[0], []).append({
+                        "session_id": session_id,
+                        "room": other_room,
+                        "role": "正式监考",
+                        "overlap": overlaps,
+                    })
+            for other_room, room_teachers in result["backups"].items():
+                for teacher in room_teachers:
+                    locations.setdefault(teacher[0], []).append({
+                        "session_id": session_id,
+                        "room": other_room,
+                        "role": "备选监考",
+                        "overlap": overlaps,
+                    })
         candidates = [
             teacher for teacher in self.teacher_pool
-            if teacher[0] != target[0] and assigned_rooms.get(teacher[0]) != room
+            if teacher[0] != target[0]
+            and not any(
+                location["session_id"] == self.current_session_id
+                and location["room"] == room
+                for location in locations.get(teacher[0], [])
+            )
         ]
         if not candidates:
             QMessageBox.information(self, "无法更换", "没有可用的替换教师。")
             return
         choices = []
         for teacher in candidates:
-            source = assigned_rooms.get(teacher[0])
-            tag = f"当前安排：{source}（存在时间冲突）" if source else "空闲/备选教师"
+            teacher_locations = locations.get(teacher[0], [])
+            conflict = next((location for location in teacher_locations if location["overlap"]), None)
+            other = teacher_locations[0] if teacher_locations else None
+            if conflict:
+                tag = f"{conflict['session_id']} {conflict['room']}｜{conflict['role']}（时间冲突）"
+            elif other:
+                tag = f"{other['session_id']} {other['room']}｜{other['role']}（非重叠时段）"
+            else:
+                tag = "空闲教师"
             choices.append(f"{teacher[1]}（{teacher[0]}）｜{tag}")
         choice, ok = self.choose_teacher(
             "更换监考人员", f"选择替换 {target[1]} 的教师：", choices
@@ -456,19 +709,22 @@ class ProctorArrangerApp(QMainWindow):
         if not ok:
             return
         replacement = candidates[choices.index(choice)]
-        source_room = assigned_rooms.get(replacement[0])
-        if source_room:
+        replacement_locations = locations.get(replacement[0], [])
+        conflict = next((location for location in replacement_locations if location["overlap"]), None)
+        if conflict:
             answer = QMessageBox.question(
                 self,
                 "发现时间冲突",
-                f"{replacement[1]} 已安排在 {source_room}。\n"
-                f"如果继续更换，将从 {source_room} 调出，原考场可能出现缺口。\n是否继续？",
+                f"{replacement[1]} 已在 {conflict['session_id']} 的 {conflict['room']} 执行{conflict['role']}。\n"
+                "如果继续更换，将从原安排中调出，原考场可能出现缺口。\n是否继续？",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if answer != QMessageBox.Yes:
                 return
-            self.assignments[source_room] = [
-                teacher for teacher in self.assignments[source_room]
+            source_result = self.schedule_results[conflict["session_id"]]
+            source_items = source_result["assignments"] if conflict["role"] == "正式监考" else source_result["backups"]
+            source_items[conflict["room"]] = [
+                teacher for teacher in source_items[conflict["room"]]
                 if teacher[0] != replacement[0]
             ]
         self.assignments[room][teacher_index] = replacement
@@ -597,11 +853,13 @@ class ProctorArrangerApp(QMainWindow):
 
 
     def export_data(self):
-        if not self.assignments:
+        if not self.schedule_results and not self.assignments:
             return
-        template_path, _ = QFileDialog.getOpenFileName(
-            self, "选择监考安排模板", "", "Excel 97-2003 (*.xls)"
-        )
+        template_path = getattr(self, "schedule_path", "")
+        if not template_path:
+            template_path, _ = QFileDialog.getOpenFileName(
+                self, "选择监考安排模板", "", "Excel 97-2003 (*.xls)"
+            )
         if not template_path:
             return
         path, _ = QFileDialog.getSaveFileName(self, "保存监考安排表", "", "Excel 97-2003 (*.xls)")
@@ -609,9 +867,14 @@ class ProctorArrangerApp(QMainWindow):
             if not path.lower().endswith(".xls"):
                 path += ".xls"
             try:
-                write_assignments_to_excel(
-                    self.assignments, template_path, header_row=2, output_path=path
-                )
+                if self.schedule_results:
+                    write_session_assignments_to_excel(
+                        self.schedule_results, template_path, header_row=2, output_path=path
+                    )
+                else:
+                    write_assignments_to_excel(
+                        self.assignments, template_path, header_row=2, output_path=path
+                    )
                 self.last_export_path = path
                 QMessageBox.information(self, "成功", f"数据已导出至：\n{path}")
             except Exception as e:
@@ -682,7 +945,14 @@ class ProctorArrangerApp(QMainWindow):
 
         # 4. 执行分组
         try:
-            groups = split_excel_by_room_groups(main_path, split_path, header_row=2, rules=rules)
+            if self.schedule_results:
+                groups = split_schedule_by_room_groups(
+                    main_path, split_path, header_row=2, rules=rules
+                )
+            else:
+                groups = split_excel_by_room_groups(
+                    main_path, split_path, header_row=2, rules=rules
+                )
             QMessageBox.information(self, "成功", f"分组表已导出至：\n{split_path}")
             self.append_log("\n" + f"[分组导出] 已按考场号生成分组：{split_path}\n")
         except Exception as e:
