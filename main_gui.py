@@ -399,51 +399,27 @@ class ProctorArrangerApp(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
 
-        move_from_room = None
-        if available:
-            choices = [f"{teacher[1]}（{teacher[0]}）｜{teacher[4]}" for teacher in available]
-            candidates = available
-            dialog_title = "添加监考人员"
-            prompt = f"选择要添加到 {self.selected_room} 的教师："
-        else:
-            # 没有空闲教师时允许调动，保证教师仍然不会出现在两个考场。
-            movable = [
-                (room, teacher)
-                for room, room_teachers in self.assignments.items()
-                if room != self.selected_room
-                for teacher in room_teachers
-            ]
-            if not movable:
-                QMessageBox.information(self, "无法添加", "没有可添加或调入的教师。")
-                return
-            move_from_room = {teacher[0]: room for room, teacher in movable}
-            candidates = [teacher for _, teacher in movable]
-            choices = [
-                f"{teacher[1]}（{teacher[0]}）｜来源考场：{move_from_room[teacher[0]]}"
-                for teacher in candidates
-            ]
-            dialog_title = "从其他考场调入教师"
-            prompt = (
-                f"当前没有空闲教师。选择调入 {self.selected_room} 的教师：\n"
-                "调入后，原考场可能出现人员缺口。"
+        if not available:
+            QMessageBox.information(
+                self,
+                "无法添加",
+                "当前没有空闲教师可添加。\n"
+                "其他考场正在监考的教师不能通过“增添人员”重复安排；"
+                "如需调换，请使用“更换选中人员”。",
             )
-        choice, ok = self.choose_teacher(dialog_title, prompt, choices)
+            return
+        candidates = available
+        choices = [f"{teacher[1]}（{teacher[0]}）｜{teacher[4]}" for teacher in candidates]
+        choice, ok = self.choose_teacher(
+            "添加监考人员", f"选择要添加到 {self.selected_room} 的教师：", choices
+        )
         if not ok:
             return
         selected = candidates[choices.index(choice)]
-        if move_from_room:
-            source_room = move_from_room[selected[0]]
-            self.assignments[source_room] = [
-                teacher for teacher in self.assignments[source_room]
-                if teacher[0] != selected[0]
-            ]
         current.append(selected)
         self.refresh_backups()
         self.display_results_with_merge(self.assignments)
-        if move_from_room:
-            self.status_label.setText(f"✅ 已将 {selected[1]} 调入 {self.selected_room}")
-        else:
-            self.status_label.setText(f"✅ 已向 {self.selected_room} 添加 1 名监考教师")
+        self.status_label.setText(f"✅ 已向 {self.selected_room} 添加 1 名监考教师")
         self.status_label.setStyleSheet("color: #4a79a5; font-weight: bold; font-size: 14pt;")
 
     def replace_person_in_room(self):
