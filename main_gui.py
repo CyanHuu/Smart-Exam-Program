@@ -8,7 +8,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QTextEdit, QHeaderView, QSplitter, QComboBox,
-    QInputDialog, QDialog, QSizePolicy, QDialogButtonBox, QLineEdit, QCheckBox
+    QInputDialog, QDialog, QSizePolicy, QDialogButtonBox, QLineEdit, QCheckBox,
+    QFrame, QStackedWidget, QButtonGroup, QMenu
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QMutex
 from PyQt5.QtGui import QBrush, QColor, QFont, QTextCursor, QTextOption, QTextCharFormat
@@ -32,6 +33,7 @@ from outputTask import (
     write_session_assignments_to_excel,
     split_excel_by_room_groups,
 )
+from timeline_view import TimelinePanel
 
 
 # ====== 日志重定向器 ======
@@ -202,9 +204,40 @@ class ProctorArrangerApp(QMainWindow):
         self.removed_proctors = {}
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        main_layout = QVBoxLayout(self.central_widget)
-        main_layout.setContentsMargins(18, 16, 18, 16)
+        root_layout = QHBoxLayout(self.central_widget)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(180)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(8, 14, 8, 14)
+        sidebar_title = QLabel("智能排考系统")
+        sidebar_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #2463A6;")
+        sidebar_layout.addWidget(sidebar_title)
+        sidebar_layout.addSpacing(12)
+        self.page_stack = QStackedWidget()
+        menu_group = QButtonGroup(self)
+        menu_group.setExclusive(True)
+        menu_items = [("排考工作台", 0), ("排考结果", 1), ("教师管理", 2), ("数据导出", 3)]
+        for label, index in menu_items:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setStyleSheet("QPushButton { text-align: left; padding: 10px; color: #25364D; background: transparent; border: 0; } QPushButton:checked { color: #2463A6; background: #EAF2FB; font-weight: bold; border-radius: 6px; }")
+            button.clicked.connect(lambda _checked, i=index: self.page_stack.setCurrentIndex(i))
+            menu_group.addButton(button, index)
+            sidebar_layout.addWidget(button)
+            if index == 0:
+                button.setChecked(True)
+        sidebar_layout.addStretch(1)
+        root_layout.addWidget(sidebar)
+
+        main_container = QWidget()
+        main_layout = QVBoxLayout(main_container)
+        main_layout.setContentsMargins(8, 6, 8, 6)
         main_layout.setSpacing(10)
+        root_layout.addWidget(main_container, 1)
 
         page_title = QLabel("智能排考系统")
         page_title.setObjectName("pageTitle")
@@ -274,13 +307,9 @@ class ProctorArrangerApp(QMainWindow):
         )
         preference_hbox.addWidget(self.preference_combo, 1)
         control_layout.addLayout(preference_hbox)
-        session_hbox = QHBoxLayout()
-        session_hbox.addWidget(QLabel("当前考试场次（对应模板工作表）"))
         self.session_combo = QComboBox()
         self.session_combo.currentIndexChanged.connect(self.display_current_session)
         self.session_combo.setEnabled(False)
-        session_hbox.addWidget(self.session_combo, 1)
-        control_layout.addLayout(session_hbox)
         control_layout.addWidget(self.btn_run)
         control_layout.addWidget(self.status_label)
 
@@ -292,6 +321,8 @@ class ProctorArrangerApp(QMainWindow):
         ])
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.result_table.cellClicked.connect(self.select_result_row)
+        self.result_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.result_table.customContextMenuRequested.connect(self.show_result_context_menu)
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Interactive)  # 允许手动调整，但我们会设默认宽
@@ -314,9 +345,9 @@ class ProctorArrangerApp(QMainWindow):
         self.log_text.setMinimumSize(330, 180)
         self.log_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_text.setStyleSheet("""
-            background-color: #252525;
-            color: #e0e0e0;
-            border: 1px solid #555;
+            background-color: #F7FAFD;
+            color: #36506B;
+            border: 1px solid #C7D9EB;
             border-radius: 6px;
             padding: 6px;
         """)
@@ -346,41 +377,80 @@ class ProctorArrangerApp(QMainWindow):
         export_layout.addWidget(self.btn_export)
         export_layout.addWidget(self.btn_split)
 
-        edit_layout = QHBoxLayout()
+        # 保留原有操作方法的按钮对象，但不再把它们放在页面上；通过结果表右键菜单触发。
         self.btn_add_person = QPushButton("给选中考场增添人员")
         self.btn_delete_person = QPushButton("删除选中人员")
         self.btn_replace_person = QPushButton("更换选中人员")
-        self.btn_workload = QPushButton("查看教师工作量")
-        self.btn_confirm_adjustment = QPushButton("确认调整并刷新")
-        self.btn_add_person.setStyleSheet(button_style)
-        self.btn_delete_person.setStyleSheet(button_style)
-        self.btn_replace_person.setStyleSheet(button_style)
-        self.btn_workload.setStyleSheet(button_style)
-        self.btn_confirm_adjustment.setStyleSheet(button_style)
         self.btn_add_person.clicked.connect(self.add_person_to_room)
         self.btn_delete_person.clicked.connect(self.delete_person_from_room)
         self.btn_replace_person.clicked.connect(self.replace_person_in_room)
-        self.btn_workload.clicked.connect(self.show_workload)
-        self.btn_confirm_adjustment.clicked.connect(self.confirm_adjustment)
         self.btn_add_person.setEnabled(False)
         self.btn_delete_person.setEnabled(False)
         self.btn_replace_person.setEnabled(False)
+        self.btn_workload = QPushButton("查看教师工作量")
+        self.btn_workload.setStyleSheet(button_style)
+        self.btn_workload.clicked.connect(self.show_workload)
         self.btn_workload.setEnabled(False)
-        self.btn_confirm_adjustment.setEnabled(False)
-        self.selected_room_label = QLabel("请先点击安排结果中的考场或教师")
-        edit_layout.addWidget(self.btn_add_person)
-        edit_layout.addWidget(self.btn_delete_person)
-        edit_layout.addWidget(self.btn_replace_person)
-        edit_layout.addWidget(self.btn_workload)
-        edit_layout.addWidget(self.selected_room_label, 1)
-        edit_layout.addWidget(self.btn_confirm_adjustment)
+        self.selected_room_label = QLabel("请右键点击结果表格中的姓名进行调整")
 
-        # 组装布局
-        main_layout.addWidget(control_widget)
-        main_layout.addWidget(QLabel("安排结果："))
-        main_layout.addWidget(splitter, 1)  # 中间区域填满上下剩余空间
-        main_layout.addLayout(edit_layout)
-        main_layout.addLayout(export_layout)
+        # 组装页面：工作台只保留输入和立即安排。
+        workbench_page = QWidget()
+        workbench_layout = QVBoxLayout(workbench_page)
+        workbench_layout.addWidget(control_widget)
+        workbench_layout.addStretch(1)
+
+        result_page = QWidget()
+        result_layout = QVBoxLayout(result_page)
+        result_layout.addWidget(QLabel("排考结果"))
+        session_hbox = QHBoxLayout()
+        session_hbox.addWidget(QLabel("当前考试场次（对应模板工作表）"))
+        session_hbox.addWidget(self.session_combo, 1)
+        result_layout.addLayout(session_hbox)
+        result_switch = QHBoxLayout()
+        self.btn_result_table = QPushButton("表格和运行日志")
+        self.btn_result_timeline = QPushButton("教师时间轴")
+        self.btn_result_table.clicked.connect(lambda: self.result_stack.setCurrentIndex(0))
+        self.btn_result_timeline.clicked.connect(self.show_result_timeline)
+        result_switch.addWidget(self.btn_result_table)
+        result_switch.addWidget(self.btn_result_timeline)
+        result_switch.addStretch(1)
+        result_layout.addLayout(result_switch)
+        self.result_stack = QStackedWidget()
+        table_page = QWidget()
+        table_layout = QVBoxLayout(table_page)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(splitter, 1)
+        self.result_stack.addWidget(table_page)
+        self.timeline_panel = TimelinePanel({}, {}, [], self)
+        self.timeline_panel.task_context_menu.connect(self.show_timeline_context_menu)
+        self.result_stack.addWidget(self.timeline_panel)
+        result_layout.addWidget(self.result_stack, 1)
+        result_layout.addWidget(self.selected_room_label)
+        self.warning_label = QLabel()
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet("background: #FFF3B0; color: #795500; border: 1px solid #F0C36A; border-radius: 5px; padding: 7px;")
+        self.warning_label.hide()
+        result_layout.addWidget(self.warning_label)
+
+        teacher_page = QWidget()
+        teacher_layout = QVBoxLayout(teacher_page)
+        teacher_layout.addWidget(QLabel("教师管理"))
+        teacher_layout.addWidget(QLabel("查看教师正式监考、备选待命和总任务量。"))
+        teacher_layout.addWidget(self.btn_workload)
+        teacher_layout.addStretch(1)
+
+        export_page = QWidget()
+        export_page_layout = QVBoxLayout(export_page)
+        export_page_layout.addWidget(QLabel("数据导出"))
+        export_page_layout.addWidget(QLabel("导出完整排考结果，或按考场规则进行分组导出。"))
+        export_page_layout.addLayout(export_layout)
+        export_page_layout.addStretch(1)
+
+        self.page_stack.addWidget(workbench_page)
+        self.page_stack.addWidget(result_page)
+        self.page_stack.addWidget(teacher_page)
+        self.page_stack.addWidget(export_page)
+        main_layout.addWidget(self.page_stack, 1)
 
     def select_classroom(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择教室文件", "", "Excel Files (*.xls *.xlsx)")
@@ -436,7 +506,6 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_delete_person.setEnabled(False)
         self.btn_replace_person.setEnabled(False)
         self.btn_workload.setEnabled(False)
-        self.btn_confirm_adjustment.setEnabled(False)
         self.session_combo.clear()
         self.session_combo.setEnabled(False)
         QApplication.processEvents()
@@ -472,27 +541,6 @@ class ProctorArrangerApp(QMainWindow):
         self.log_text.moveCursor(QTextCursor.Start)
         self.log_text.verticalScrollBar().setValue(0)
 
-    def confirm_adjustment(self):
-        """确认人工调整后，刷新当前表格、备选人员和全部场次概况。"""
-        if not self.schedule_results or not self.current_session_id:
-            return
-        self.refresh_backups()
-        for session_id in self.schedule_results:
-            self.refresh_session_report(session_id)
-        self.display_current_session()
-        self.log_text.clear()
-        self.append_log("【确认调整后最新结果】以下为全部考试安排表\n")
-        for session_id in self.schedule_results:
-            self.append_current_session_summary(session_id)
-        report = self._combined_report()
-        self.show_log_start()
-        self.status_label.setText(
-            f"✅ 已确认全部调整：{report['total_sessions']} 个工作表，"
-            f"安排 {report['total_assigned']} 人，"
-            f"缺口 {report['shortage']} 人"
-        )
-        self.status_label.setStyleSheet("color: #70d6ad; font-weight: bold; font-size: 14pt;")
-
     def on_finished(self, schedule_results, error):
         if error or schedule_results is None:
             self.log_text.show()
@@ -507,6 +555,7 @@ class ProctorArrangerApp(QMainWindow):
         self.schedule_results = schedule_results
         self.workload = getattr(self.worker, "workload", {})
         self.teacher_pool = getattr(self.worker, "teacher_pool", [])
+        self.timeline_panel.set_data(self.schedule_results, self.workload, self.teacher_pool)
         self.session_combo.blockSignals(True)
         self.session_combo.clear()
         for session_id, result in self.schedule_results.items():
@@ -526,6 +575,7 @@ class ProctorArrangerApp(QMainWindow):
         if self.schedule_results:
             self.session_combo.setCurrentIndex(0)
             self.display_current_session()
+        self.update_shortage_warning()
         # 成功后保留日志框，避免界面留下空白区域；结果表仍占主要空间。
         self.log_text.show()
         self.log_title.show()
@@ -534,7 +584,48 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_export.setEnabled(True)
         self.btn_split.setEnabled(True)
         self.btn_workload.setEnabled(True)
-        self.btn_confirm_adjustment.setEnabled(True)
+
+    def show_result_timeline(self):
+        if not self.schedule_results:
+            self.warning_label.setText("⚠ 还没有排考结果，请先在排考工作台完成排考。")
+            self.warning_label.show()
+            return
+        self.timeline_panel.set_data(self.schedule_results, self.workload, self.teacher_pool)
+        self.update_shortage_warning()
+        self.result_stack.setCurrentIndex(1)
+
+    def update_shortage_warning(self):
+        shortages = []
+        for session_id, result in self.schedule_results.items():
+            for item in result["report"].get("unfilled_rooms", []):
+                shortages.append(
+                    f"场次 {session_id} 的考场 {item['room']} 缺少 {item['missing']} 名监考教师"
+                )
+        if shortages:
+            self.warning_label.setText("⚠ 人员缺口：" + "；".join(shortages))
+            self.warning_label.show()
+        else:
+            self.warning_label.hide()
+
+    def refresh_after_manual_change(self, detail, excluded_ids=None):
+        """人工增删改后立即刷新全部场次、备选、日志和底部缺口提醒。"""
+        self.refresh_backups(excluded_ids=excluded_ids)
+        for session_id in self.schedule_results:
+            self.refresh_session_report(session_id)
+        self.display_current_session()
+        self.update_shortage_warning()
+        self.log_text.clear()
+        self.append_log("【调整后最新总结果】以下为全部考试安排表\n")
+        self.append_log(detail + "\n")
+        for session_id in self.schedule_results:
+            self.append_current_session_summary(session_id)
+        report = self._combined_report()
+        self.show_log_start()
+        self.status_label.setText(
+            f"✅ 已自动刷新：{report['total_sessions']} 个场次，"
+            f"安排 {report['total_assigned']} 人，缺口 {report['shortage']} 人"
+        )
+        self.status_label.setStyleSheet("color: #70d6ad; font-weight: bold; font-size: 14pt;")
 
     def _combined_report(self):
         reports = [result["report"] for result in self.schedule_results.values()]
@@ -569,6 +660,48 @@ class ProctorArrangerApp(QMainWindow):
         self.btn_add_person.setEnabled(True)
         self.btn_delete_person.setEnabled(teacher_index is not None)
         self.btn_replace_person.setEnabled(teacher_index is not None)
+
+    def show_result_context_menu(self, position):
+        """在结果表的教师姓名单元格上提供 Windows 风格右键操作菜单。"""
+        item = self.result_table.itemAt(position)
+        if item is None or item.column() != 1:
+            return
+        row = item.row()
+        if row < 0 or row >= len(self.table_row_records):
+            return
+        room, teacher_index = self.table_row_records[row]
+        if room not in self.assignments:
+            return
+        self.select_result_row(row, 1)
+        self.show_adjustment_menu(
+            self.result_table.viewport().mapToGlobal(position),
+            has_teacher=teacher_index is not None,
+        )
+
+    def show_timeline_context_menu(self, task, global_pos):
+        """把时间轴正式监考任务映射回结果表，再复用同一组调整操作。"""
+        index = self.session_combo.findData(task["session_id"])
+        if index >= 0:
+            self.session_combo.setCurrentIndex(index)
+        if not self.assignments:
+            return
+        for row, (room, teacher_index) in enumerate(self.table_row_records):
+            if room != task["room"] or teacher_index is None:
+                continue
+            teacher = self.assignments[room][teacher_index]
+            if teacher[0] == task["teacher_id"]:
+                self.select_result_row(row, 1)
+                self.show_adjustment_menu(global_pos)
+                return
+
+    def show_adjustment_menu(self, global_pos, has_teacher=True):
+        """显示增删改右键菜单。"""
+        menu = QMenu(self)
+        menu.addAction("给选中考场增添人员", self.add_person_to_room)
+        if has_teacher:
+            menu.addAction("删除选中人员", self.delete_person_from_room)
+            menu.addAction("更换选中人员", self.replace_person_in_room)
+        menu.exec_(global_pos)
 
     def show_workload(self):
         if not self.workload:
@@ -674,6 +807,7 @@ class ProctorArrangerApp(QMainWindow):
             )
         self.backup_assignments = self.schedule_results[self.current_session_id]["backups"]
         self.workload = build_workload_stats(self.schedule_results, self.teacher_pool)
+        self.timeline_panel.set_data(self.schedule_results, self.workload, self.teacher_pool)
 
     def refresh_current_report(self):
         """人工修改后重新计算当前场次的概况。"""
@@ -852,17 +986,11 @@ class ProctorArrangerApp(QMainWindow):
         changed_room = self.selected_room
         changed_session = self.current_session_id
         current.append(selected)
-        self.refresh_backups()
-        self.refresh_current_report()
-        self.display_results_with_merge(self.assignments)
-        self.append_log(
-            f"\n[手动修改] 场次 {changed_session}｜考场 {changed_room}\n"
+        self.refresh_after_manual_change(
+            f"[手动修改] 场次 {changed_session}｜考场 {changed_room}\n"
             f"新增正式监考：{selected[1]}（{selected[0]}）\n"
-            "备选人员已自动重新检查。\n"
+            "备选人员已自动重新检查。"
         )
-        self.append_current_session_summary()
-        self.status_label.setText(f"✅ 已向 {changed_room} 添加 1 名监考教师")
-        self.status_label.setStyleSheet("color: #70d6ad; font-weight: bold; font-size: 14pt;")
 
     def replace_person_in_room(self):
         if not self.assignments or not self.selected_room:
@@ -957,18 +1085,12 @@ class ProctorArrangerApp(QMainWindow):
                 if teacher[0] != replacement[0]
             ]
         self.assignments[room][teacher_index] = replacement
-        self.refresh_backups()
-        self.refresh_current_report()
-        self.display_results_with_merge(self.assignments)
         conflict_note = "（已处理原安排中的时间冲突）" if conflict else ""
-        self.append_log(
-            f"\n[手动修改] 场次 {changed_session}｜考场 {changed_room}\n"
+        self.refresh_after_manual_change(
+            f"[手动修改] 场次 {changed_session}｜考场 {changed_room}\n"
             f"更换监考：{old_name} → {replacement[1]}（{replacement[0]}）{conflict_note}\n"
-            "备选人员已自动重新检查。\n"
+            "备选人员已自动重新检查。"
         )
-        self.append_current_session_summary()
-        self.status_label.setText(f"✅ 已将 {old_name} 更换为 {replacement[1]}")
-        self.status_label.setStyleSheet("color: #70d6ad; font-weight: bold; font-size: 14pt;")
 
     def delete_person_from_room(self):
         if not self.assignments or not self.selected_room:
@@ -994,17 +1116,12 @@ class ProctorArrangerApp(QMainWindow):
         del self.assignments[room][teacher_index]
         self.removed_proctors.setdefault((changed_session, changed_room), {})[teacher[0]] = teacher
         # 删除的教师保持空闲，不因备选刷新而自动流转到其他考场。
-        self.refresh_backups(excluded_ids={teacher[0]})
-        self.refresh_current_report()
-        self.display_results_with_merge(self.assignments)
-        self.append_log(
-            f"\n[手动修改] 场次 {changed_session}｜考场 {changed_room}\n"
+        self.refresh_after_manual_change(
+            f"[手动修改] 场次 {changed_session}｜考场 {changed_room}\n"
             f"删除正式监考：{deleted_name}（{teacher[0]}）\n"
-            "备选人员已自动重新检查。\n"
+            "备选人员已自动重新检查。",
+            excluded_ids={teacher[0]},
         )
-        self.append_current_session_summary()
-        self.status_label.setText(f"✅ 已从 {changed_room} 删除 1 名监考教师")
-        self.status_label.setStyleSheet("color: #70d6ad; font-weight: bold; font-size: 14pt;")
 
 
 
