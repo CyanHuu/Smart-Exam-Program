@@ -56,12 +56,14 @@ def load_exam_sessions(template_path, classroom_data, header_row=2):
             raise ValueError(f"工作表 {sheet.name} 没有有效的考场数据")
         headers = sheet.row_values(header_row)
         room_col = _find_column(headers, ["教室编号", "考场号", "room"])
+        candidate_col = _find_column(headers, ["考生人数", "人数", "candidate"])
         if room_col is None:
             raise ValueError(f"工作表 {sheet.name} 缺少教室编号列")
         title = _text(sheet.cell_value(0, 0))
         period_text = _text(sheet.cell_value(1, 0))
         start, end = _parse_period(period_text, sheet.name)
         rooms = []
+        room_meta = {}
         seen = set()
         previous_room = ""
         for row_index in range(header_row + 1, sheet.nrows):
@@ -76,6 +78,9 @@ def load_exam_sessions(template_path, classroom_data, header_row=2):
                 raise ValueError(f"工作表 {sheet.name} 的教室 {room} 不在教室输入表中")
             seen.add(room)
             rooms.append((room, rooms_required[room]))
+            room_meta[room] = {
+                "candidate_count": _text(sheet.cell_value(row_index, candidate_col)) if candidate_col is not None else "",
+            }
         if not rooms:
             raise ValueError(f"工作表 {sheet.name} 没有识别到有效教室")
         sessions.append({
@@ -86,6 +91,7 @@ def load_exam_sessions(template_path, classroom_data, header_row=2):
             "start": start,
             "end": end,
             "rooms": rooms,
+            "room_meta": room_meta,
         })
     sessions.sort(key=lambda session: session["start"])
     return sessions
