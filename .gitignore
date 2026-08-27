@@ -5,4 +5,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .idea/
+_docx_work/
+_prd_template_work/
+_spreadsheet_work/
 
