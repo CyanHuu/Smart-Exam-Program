@@ -3,6 +3,7 @@ import shutil
 
 import xlrd
 import xlwt
+from openpyxl import Workbook, load_workbook
 from xlutils.copy import copy
 
 
@@ -106,6 +107,8 @@ def write_assignments_to_excel(assignments, input_output_path, header_row=2, out
 def write_session_assignments_to_excel(schedule_results, input_output_path, header_row=2, output_path=None):
     """按场次分别写入模板的多个工作表，并保留原始格式。"""
     target_path = output_path or input_output_path
+    if str(input_output_path).lower().endswith(".xlsx"):
+        return write_session_assignments_to_xlsx(schedule_results, input_output_path, header_row, output_path)
     if output_path and output_path != input_output_path:
         try:
             shutil.copyfile(input_output_path, output_path)
@@ -140,6 +143,38 @@ def write_session_assignments_to_excel(schedule_results, input_output_path, head
                     sheet_wb, row_index, staff_text, staff_col, sheet_rb.merged_cells
                 )
     _save_workbook(wb, target_path)
+    print(f"[OK] 多场次监考安排已写入: {target_path}")
+
+
+def write_session_assignments_to_xlsx(schedule_results, input_output_path, header_row=2, output_path=None):
+    target_path = output_path or input_output_path
+    if output_path and output_path != input_output_path:
+        shutil.copyfile(input_output_path, output_path)
+    workbook = load_workbook(target_path)
+    for sheet in workbook.worksheets:
+        result = schedule_results.get(str(sheet.title))
+        if not result:
+            continue
+        headers = [cell.value for cell in sheet[header_row + 1]]
+        room_col = _find_column(headers, ["教室编号", "考场号", "room"])
+        staff_col = _find_column(headers, ["监考人员", "监考教师", "staff", "proctor"])
+        if room_col is None or staff_col is None:
+            raise ValueError(f"工作表 {sheet.title} 未找到教室编号或监考人员列")
+        previous_room = ""
+        for row_index in range(header_row + 2, sheet.max_row + 1):
+            room = str(sheet.cell(row_index, room_col + 1).value or "").strip() or previous_room
+            if room:
+                previous_room = room
+            if room in result["assignments"]:
+                target = sheet.cell(row_index, staff_col + 1)
+                if target.__class__.__name__ == "MergedCell":
+                    for merged in sheet.merged_cells.ranges:
+                        if target.coordinate in merged:
+                            target = sheet.cell(merged.min_row, merged.min_col)
+                            break
+                target.value = _assignment_text(result["assignments"][room])
+                target.alignment = target.alignment.copy(wrap_text=True, vertical="center")
+    workbook.save(target_path)
     print(f"[OK] 多场次监考安排已写入: {target_path}")
 
 
@@ -337,13 +372,17 @@ def split_excel_by_room_groups(input_path, output_path, header_row, rules):
     print(f"[OK] 已按考场号导出 {len(groups)} 组: {output_path}")
 
 
-def split_schedule_by_room_groups(input_path, output_path, header_row, rules):
+def split_schedule_by_room_groups(input_path, output_path, header_row, rules, session_ids=None):
     """多场次模板按考场分组，每个场次和分组生成一个工作表。"""
+    if str(input_path).lower().endswith(".xlsx"):
+        return _split_schedule_by_room_groups_xlsx(input_path, output_path, header_row, rules, session_ids)
     groups = parse_room_groups(rules)
     rb = xlrd.open_workbook(input_path, formatting_info=True)
     workbook = xlwt.Workbook(encoding="utf-8")
     total = 0
     for sheet in rb.sheets():
+        if session_ids and str(sheet.name) not in {str(value) for value in session_ids}:
+            continue
         headers = sheet.row_values(header_row)
         room_col = _find_column(headers, ["教室编号", "考场号", "room"])
         staff_col = _find_column(headers, ["监考人员", "监考教师", "staff", "proctor"])
@@ -375,6 +414,48 @@ def split_schedule_by_room_groups(input_path, output_path, header_row, rules):
                 worksheet.write(header_row + 1, 0, f"未找到匹配考场：{','.join(group)}", _export_styles()[-1])
             total += 1
     _save_workbook(workbook, output_path)
+    print(f"[OK] 多场次分组导出 {total} 个工作表: {output_path}")
+
+
+def _split_schedule_by_room_groups_xlsx(input_path, output_path, header_row, rules, session_ids=None):
+    groups = parse_room_groups(rules)
+    source = load_workbook(input_path, data_only=False)
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    wanted = {str(value) for value in session_ids} if session_ids else None
+    total = 0
+    for sheet in source.worksheets:
+        if wanted and str(sheet.title) not in wanted:
+            continue
+        headers = [cell.value for cell in sheet[header_row + 1]]
+        room_col = _find_column(headers, ["教室编号", "考场号", "room"])
+        if room_col is None:
+            continue
+        rows = []
+        previous_room = ""
+        for row_index in range(header_row + 2, sheet.max_row + 1):
+            values = [sheet.cell(row_index, col).value for col in range(1, sheet.max_column + 1)]
+            room = str(values[room_col] or "").strip() or previous_room
+            if room:
+                previous_room = room
+            values[room_col] = room
+            rows.append((room, values))
+        for index, group in enumerate(groups, start=1):
+            output_sheet = workbook.create_sheet(f"{sheet.title}-第{index}组"[:31])
+            for row_index in range(1, header_row + 2):
+                for col_index in range(1, sheet.max_column + 1):
+                    source_cell = sheet.cell(row_index, col_index)
+                    output_sheet.cell(row_index, col_index, source_cell.value)
+            selected = [values for room, values in rows if room in set(group)]
+            for offset, values in enumerate(selected, start=header_row + 2):
+                for col_index, value in enumerate(values, start=1):
+                    output_sheet.cell(offset, col_index, value)
+            if not selected:
+                output_sheet.cell(header_row + 2, 1, f"未找到匹配考场：{','.join(group)}")
+            total += 1
+    if not total:
+        raise ValueError("未找到可分组的考试场次")
+    workbook.save(output_path)
     print(f"[OK] 多场次分组导出 {total} 个工作表: {output_path}")
 
 

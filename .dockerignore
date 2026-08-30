@@ -1,0 +1,7 @@
+__pycache__/
+.git/
+.idea/
+pk_project/
+测试文件/
+*.docx
+*.svg

@@ -40,6 +40,10 @@ def analyze_teacher_list(file_path):
     gender_col = _find_column(df.columns, ["性别", "gender"])
     experience_col = _find_column(df.columns, ["经验", "experience", "有经验"])
     dept_col = _find_column(df.columns, ["部门", "department", "dept"])
+    unavailable_col = _find_column(df.columns, ["不可用场次", "不可监考场次", "unavailable"])
+    max_formal_col = _find_column(df.columns, ["最多正式监考次数", "最多监考次数", "maxformal"])
+    consecutive_col = _find_column(df.columns, ["允许连续监考", "allowconsecutive"])
+    avoid_rooms_col = _find_column(df.columns, ["回避考场", "avoidrooms"])
     required = [("工号", id_col), ("姓名", name_col), ("性别", gender_col), ("经验", experience_col), ("部门", dept_col)]
     missing = [label for label, column in required if column is None]
     if missing:
@@ -51,6 +55,22 @@ def analyze_teacher_list(file_path):
         "gender_col": df[gender_col].fillna("").map(lambda value: _normalise_flag(value, "性别", {"0", "女", "female", "f"}, {"1", "男", "male", "m"})),
         "experience_col": df[experience_col].fillna("").map(lambda value: _normalise_flag(value, "经验", {"0", "否", "无", "无经验", "no", "false"}, {"1", "是", "有", "有经验", "yes", "true"})),
         "dept_col": df[dept_col].fillna("").map(lambda value: str(value).strip()),
+        "unavailable_sessions_col": (
+            df[unavailable_col].fillna("").map(lambda value: str(value).strip())
+            if unavailable_col is not None else ""
+        ),
+        "max_formal_count_col": (
+            df[max_formal_col].fillna("").map(lambda value: str(value).strip())
+            if max_formal_col is not None else ""
+        ),
+        "allow_consecutive_col": (
+            df[consecutive_col].fillna("").map(lambda value: str(value).strip())
+            if consecutive_col is not None else ""
+        ),
+        "avoid_rooms_col": (
+            df[avoid_rooms_col].fillna("").map(lambda value: str(value).strip())
+            if avoid_rooms_col is not None else ""
+        ),
     })
     if result.empty:
         raise ValueError("教师名单为空")

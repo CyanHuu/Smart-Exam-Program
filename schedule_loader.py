@@ -4,6 +4,7 @@ from datetime import datetime
 import re
 
 import xlrd
+from openpyxl import load_workbook
 
 
 def _text(value):
@@ -47,6 +48,8 @@ def periods_overlap(left, right):
 
 def load_exam_sessions(template_path, classroom_data, header_row=2):
     """读取模板全部工作表，返回统一的考试场次结构。"""
+    if str(template_path).lower().endswith(".xlsx"):
+        return _load_exam_sessions_xlsx(template_path, classroom_data, header_row)
     workbook = xlrd.open_workbook(template_path, formatting_info=True)
     rooms_required = {str(room).strip(): int(count) for room, count in classroom_data}
     sessions = []
@@ -93,5 +96,39 @@ def load_exam_sessions(template_path, classroom_data, header_row=2):
             "rooms": rooms,
             "room_meta": room_meta,
         })
+    sessions.sort(key=lambda session: session["start"])
+    return sessions
+
+
+def _load_exam_sessions_xlsx(template_path, classroom_data, header_row=2):
+    workbook = load_workbook(template_path, data_only=True)
+    rooms_required = {str(room).strip(): int(count) for room, count in classroom_data}
+    sessions = []
+    for sheet in workbook.worksheets:
+        if sheet.max_row <= header_row + 1:
+            raise ValueError(f"工作表 {sheet.title} 没有有效的考场数据")
+        headers = [cell.value for cell in sheet[header_row + 1]]
+        room_col = _find_column(headers, ["教室编号", "考场号", "room"])
+        candidate_col = _find_column(headers, ["考生人数", "人数", "candidate"])
+        if room_col is None:
+            raise ValueError(f"工作表 {sheet.title} 缺少教室编号列")
+        title = _text(sheet.cell(1, 1).value)
+        period_text = _text(sheet.cell(2, 1).value)
+        start, end = _parse_period(period_text, sheet.title)
+        rooms, room_meta, seen, previous_room = [], {}, set(), ""
+        for row_index in range(header_row + 2, sheet.max_row + 1):
+            room = _text(sheet.cell(row_index, room_col + 1).value) or previous_room
+            if room:
+                previous_room = room
+            if not room or room in seen:
+                continue
+            if room not in rooms_required:
+                raise ValueError(f"工作表 {sheet.title} 的教室 {room} 不在教室输入表中")
+            seen.add(room)
+            rooms.append((room, rooms_required[room]))
+            room_meta[room] = {"candidate_count": _text(sheet.cell(row_index, candidate_col + 1).value) if candidate_col is not None else ""}
+        if not rooms:
+            raise ValueError(f"工作表 {sheet.title} 没有识别到有效教室")
+        sessions.append({"session_id": str(sheet.title), "sheet_index": sheet._id, "title": title, "period_text": period_text, "start": start, "end": end, "rooms": rooms, "room_meta": room_meta})
     sessions.sort(key=lambda session: session["start"])
     return sessions

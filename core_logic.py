@@ -313,7 +313,13 @@ def build_workload_stats(session_results, teachers):
     }
     for result in session_results.values():
         session = result["session"]
-        label = f"{session['session_id']} {session['start']:%Y-%m-%d %H:%M}-{session['end']:%H:%M}"
+        start = session["start"]
+        end = session["end"]
+        if hasattr(start, "strftime") and hasattr(end, "strftime"):
+            period = f"{start:%Y-%m-%d %H:%M}-{end:%H:%M}"
+        else:
+            period = f"{start}-{end}"
+        label = f"{session['session_id']} {period}"
         for room, room_teachers in result["assignments"].items():
             for teacher in room_teachers:
                 item = workload[teacher[0]]

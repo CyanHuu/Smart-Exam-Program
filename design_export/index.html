@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智能排考系统 - 设计稿</title>
+  <link rel="stylesheet" href="./styles.css?v=5" />
+</head>
+<body>
+  <div id="loginView" class="login-view">
+    <div class="login-card">
+      <div class="brand">智能排考系统</div>
+      <p class="login-subtitle">考务工作台登录</p>
+      <form id="loginForm">
+        <label>账号<input id="loginUsername" autocomplete="username" required></label>
+        <label>密码<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+        <button class="primary-button login-button">登录</button>
+        <p id="loginMessage" class="error-text" role="alert"></p>
+      </form>
+      <small class="login-hint">管理员：admin / admin123；监考老师：使用教师表中的工号，密码统一为 123456</small>
+    </div>
+  </div>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">智能排考系统</div>
+      <nav>
+        <a class="nav-item admin-only active" href="#workbench" data-page="workbench">排考工作台</a>
+        <a class="nav-item" href="#results" data-page="results"><span id="resultsNavLabel">排考结果</span></a>
+        <a class="nav-item admin-only" href="#workload" data-page="workload">查看教师工作量</a>
+        <a class="nav-item teacher-only" href="#timeline" data-page="timeline">我的排考时间轴</a>
+        <a class="nav-item" href="#dispatch" data-page="dispatch">智能调度</a>
+        <a class="nav-item" href="#exports" data-page="exports">数据导出 / 分组导出</a>
+      </nav>
+      <div class="sidebar-footer">考务工作台</div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <div id="pageBreadcrumb" class="eyebrow">智能排考系统 / 排考工作台</div>
+          <h1 id="pageTitle">排考工作台</h1>
+        </div>
+        <div class="header-status"><span class="status-dot"></span><span id="systemStatus">系统就绪</span> <button id="logoutButton" class="logout-button">退出登录</button></div>
+      </header>
+
+      <section id="workbench" class="panel import-panel page-section">
+        <div class="section-heading"><span class="step">1</span><div><h2>导入考试数据</h2><p>选择排考所需的三个 Excel 文件</p></div></div>
+        <div class="workbench-layout">
+          <div class="upload-area">
+            <div class="upload-tip">支持 .xls / .xlsx 文件，上传后系统会自动读取并校验</div>
+            <div class="file-grid">
+              <label class="file-card"><span class="file-icon">XLS</span><div><strong>教室编号</strong><small id="classroomName">点击选择文件</small></div><span class="upload-arrow">＋</span><input id="classroomFile" type="file" accept=".xls,.xlsx" hidden></label>
+              <label class="file-card"><span class="file-icon">XLS</span><div><strong>教师名单</strong><small id="teacherName">点击选择文件</small></div><span class="upload-arrow">＋</span><input id="teacherFile" type="file" accept=".xls,.xlsx" hidden></label>
+              <label class="file-card"><span class="file-icon">XLS</span><div><strong>考场 / 考试安排</strong><small id="scheduleName">点击选择文件</small></div><span class="upload-arrow">＋</span><input id="scheduleFile" type="file" accept=".xls,.xlsx" hidden></label>
+            </div>
+            <button id="solveButton" class="primary-button">立即安排</button>
+          </div>
+          <div class="progress-card">
+            <h3>流程进度</h3>
+            <div id="progressSteps" class="progress-steps">
+              <div class="progress-step" data-step="1"><span class="step-marker">1</span><div><strong>导入教室数据</strong><small>等待上传文件</small></div></div>
+              <div class="progress-step" data-step="2"><span class="step-marker">2</span><div><strong>导入教师名单</strong><small>等待上传文件</small></div></div>
+              <div class="progress-step" data-step="3"><span class="step-marker">3</span><div><strong>导入考场安排</strong><small>等待上传文件</small></div></div>
+              <div class="progress-step" data-step="4"><span class="step-marker">4</span><div><strong>智能排考</strong><small>等待开始安排</small></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="api-row"><span id="message"></span></div>
+        <div class="workbench-log"><div class="log-heading">运行日志 <span class="live">辅助信息</span></div><div id="logs" class="logs"><p>等待操作...</p></div></div>
+      </section>
+
+      <section id="adminSessionPanel" class="panel session-panel page-section" data-page-section="results">
+        <div class="section-heading compact"><span class="step">2</span><h2>当前考试场次</h2></div>
+        <select id="sessionSelect" class="session-select"><option>请先导入并排考</option></select>
+        <div id="summary" class="summary"><span>等待数据</span></div>
+      </section>
+
+      <section id="results" class="results-grid page-section" data-page-section="results">
+        <div id="teacherPersonalView" class="teacher-personal-view teacher-only">
+          <div class="panel-title"><h2>我的监考安排</h2><span class="tag success-tag">已登录</span></div>
+<div class="teacher-next-card"><div class="teacher-next-heading"><span class="calendar-mark">▣</span><div><small>下一场监考</small><h3 id="teacherNextTitle">暂无安排</h3></div><span id="teacherNextStatus" class="assignment-status">待确认</span></div><div id="teacherNextDetails" class="teacher-next-details"></div></div>
+          <div class="panel teacher-upcoming"><div class="panel-title"><h2>近期监考安排</h2><span class="toolbar-hint">按考试时间排序</span></div><div id="teacherUpcomingList" class="teacher-upcoming-list"></div></div>
+          <div class="teacher-reminder"><strong>温馨提醒</strong><span>请提前 30 分钟到达考场，并携带监考证、身份证和黑色签字笔。</span></div>
+        </div>
+        <div id="adminResultsView" class="panel result-panel">
+          <div class="panel-title"><h2>考场安排结果</h2><span id="sessionTag" class="tag">未生成</span></div>
+          <div class="result-metrics"><div><small>考场数量</small><strong id="roomTotal">—</strong></div><div><small>监考需求</small><strong id="neededTotal">—</strong></div><div><small>已安排</small><strong id="assignedTotal">—</strong></div><div class="metric-warning"><small>人员缺口</small><strong id="shortageTotal">—</strong></div></div>
+          <div class="teacher-filter teacher-only"><label>选择监考老师 <select id="teacherSelect"><option value="">请先完成排考</option></select></label><span class="toolbar-hint">只显示该教师负责的考场</span></div>
+          <div class="result-toolbar"><label>选择考场 <select id="roomSelect"><option>请先排考</option></select></label><span class="toolbar-hint">可选择全部考场或单独查看</span></div>
+          <div id="backupNotice" class="backup-notice" hidden></div>
+          <div class="table-scroll"><table>
+            <thead><tr><th>教室编号</th><th>姓名</th><th>工号</th><th>部门</th><th>性别</th><th>经验</th><th>角色</th><th>备选监考</th></tr></thead>
+            <tbody id="resultBody"><tr><td colspan="8">排考结果会显示在这里</td></tr></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <section id="timeline" class="panel page-section" data-page-section="timeline"><div class="panel-title"><h2>我的排考时间轴</h2><span class="tag">自动显示当前登录教师</span></div><p class="timeline-intro">按日期查看你的全部监考任务，任务颜色代表监考身份。</p><div class="timeline-legend"><span><i class="legend-dot first"></i>第一监考</span><span><i class="legend-dot formal"></i>监考人员</span><span><i class="legend-dot backup"></i>备选监考</span></div><div id="timelineBody" class="timeline-body">登录后自动加载个人排考时间表</div></section>
+      <section id="workload" class="panel page-section" data-page-section="workload"><div class="panel-title"><h2>查看教师工作量</h2><span class="tag">正式监考 / 备选待命</span></div><div class="workload-kpis"><div><small>教师总数</small><strong id="teacherTotal">—</strong></div><div><small>正式监考总次数</small><strong id="formalTotal">—</strong></div><div><small>备选待命总次数</small><strong id="backupTotal">—</strong></div><div><small>人均任务量</small><strong id="averageTotal">—</strong></div></div><div class="workload-tools"><input id="workloadSearch" placeholder="搜索教师姓名或工号"><select id="workloadSort"><option value="total">按总任务量排序</option><option value="formal">按正式监考排序</option><option value="backup">按备选待命排序</option><option value="name">按姓名排序</option></select><span id="workloadSummary">排考完成后显示统计</span></div><div class="table-scroll"><table><thead><tr><th>工号</th><th>教师</th><th>正式监考</th><th>备选待命</th><th>总任务量</th><th>任务占比</th><th>任务明细</th></tr></thead><tbody id="workloadBody"><tr><td colspan="7">排考完成后查看教师工作量</td></tr></tbody></table></div></section>
+      <section id="dispatch" class="panel page-section" data-page-section="dispatch"><div class="panel-title"><h2>智能调度</h2><span class="tag">排考辅助中心</span></div><div class="dispatch-intro"><div class="dispatch-icon">AI</div><div><h3>让排考安排更高效</h3><p>根据考试场次、考场容量、教师工作量和监考身份，集中查看和管理排考调度信息。</p></div></div><div class="dispatch-cards"><div class="dispatch-card"><small>管理员功能</small><strong>智能生成排考方案</strong><span>在排考工作台导入数据后，系统自动计算并生成监考安排。</span><a href="#workbench" data-page="workbench" class="outline-button">进入排考工作台</a></div><div class="dispatch-card"><small>教师功能</small><strong>查看个人调度安排</strong><span>登录后自动展示本人监考任务、日期、考场和监考角色。</span><a href="#results" data-page="results" class="outline-button">查看我的安排</a></div></div></section>
+      <section id="exports" class="panel page-section" data-page-section="exports"><div class="panel-title"><h2>数据导出 / 分组导出</h2></div><div class="export-options"><div class="export-card"><h3>数据导出</h3><p>下载包含全部考试场次和监考安排的完整 Excel 文件。</p><button id="exportButton2" class="outline-button">⇩ 导出完整数据</button></div><div class="export-card"><h3>分组导出</h3><p>选择全部日期或某个考试场次，再按考场范围生成分组工作表。</p><select id="exportSession" class="export-session"><option value="">请先完成排考</option></select><div class="group-export-control"><input id="groupRules" placeholder="例如：C101-C112 或 C101,C103,C105"><button id="groupExportButton" class="outline-button">▦ 导出分组数据</button></div></div></div><p id="exportMessage" class="export-message"></p></section>
+    </main>
+  </div>
+  <script src="./app.js?v=21"></script>
+</body>
+</html>
