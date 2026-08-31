@@ -1,5 +1,6 @@
 import re
 import shutil
+from copy import copy as copy_style
 
 import xlrd
 import xlwt
@@ -26,6 +27,10 @@ def _find_column(headers, keywords):
             if keyword in text:
                 return index
     return None
+
+
+def _room_key(value):
+    return str(value or "").strip().casefold()
 
 
 def _assignment_text(teachers):
@@ -61,6 +66,38 @@ def _set_staff_row_height(sheet, row_index, value, col_index=None, merged_cells=
     height = max(420, (300 * lines + span - 1) // span)
     for row in range(row_start, row_end):
         sheet.row(row).height = height
+
+
+def _set_xlsx_staff_cell(sheet, target, value):
+    target.value = value
+    target.alignment = target.alignment.copy(wrap_text=True, vertical="center")
+    lines = max(1, str(value or "").count("\n") + 1)
+    sheet.row_dimensions[target.row].height = max(22, min(120, 18 * lines))
+
+
+def _copy_xlsx_cell(source, target):
+    if source.has_style:
+        target._style = copy_style(source._style)
+    if source.number_format:
+        target.number_format = source.number_format
+    if source.hyperlink:
+        target._hyperlink = copy_style(source.hyperlink)
+    if source.comment:
+        target.comment = copy_style(source.comment)
+
+
+def _copy_xlsx_dimensions(source, target):
+    for key, dimension in source.column_dimensions.items():
+        target.column_dimensions[key].width = dimension.width
+        target.column_dimensions[key].hidden = dimension.hidden
+        target.column_dimensions[key].bestFit = dimension.bestFit
+    for key, dimension in source.row_dimensions.items():
+        target.row_dimensions[key].height = dimension.height
+        target.row_dimensions[key].hidden = dimension.hidden
+        target.row_dimensions[key].outlineLevel = dimension.outlineLevel
+    target.sheet_format.defaultColWidth = source.sheet_format.defaultColWidth
+    target.sheet_format.defaultRowHeight = source.sheet_format.defaultRowHeight
+    target.freeze_panes = source.freeze_panes
 
 
 def write_assignments_to_excel(assignments, input_output_path, header_row=2, output_path=None):
@@ -172,8 +209,7 @@ def write_session_assignments_to_xlsx(schedule_results, input_output_path, heade
                         if target.coordinate in merged:
                             target = sheet.cell(merged.min_row, merged.min_col)
                             break
-                target.value = _assignment_text(result["assignments"][room])
-                target.alignment = target.alignment.copy(wrap_text=True, vertical="center")
+                _set_xlsx_staff_cell(sheet, target, _assignment_text(result["assignments"][room]))
     workbook.save(target_path)
     print(f"[OK] 多场次监考安排已写入: {target_path}")
 
@@ -201,7 +237,7 @@ def parse_room_groups(rules):
             match = re.fullmatch(r"([A-Za-z\u4e00-\u9fff]*)(\d+)\s*-\s*([A-Za-z\u4e00-\u9fff]*)(\d+)", token)
             if match:
                 prefix1, start_text, prefix2, end_text = match.groups()
-                if prefix1 != prefix2:
+                if prefix1.casefold() != prefix2.casefold():
                     raise ValueError(f"考场号范围前缀不一致: {token}")
                 start, end = int(start_text), int(end_text)
                 if start > end or end - start > 10000:
@@ -360,7 +396,8 @@ def split_excel_by_room_groups(input_path, output_path, header_row, rules):
     _, source_sheet, headers, room_col, staff_col, records = _load_schedule(input_path, header_row)
     workbook = xlwt.Workbook(encoding="utf-8")
     for index, group in enumerate(groups, start=1):
-        selected = [row for row in records if row[room_col] in set(group)]
+        group_set = {_room_key(room) for room in group}
+        selected = [row for row in records if _room_key(row[room_col]) in group_set]
         rows = [source_sheet.row_values(row_index) for row_index in range(header_row + 1)]
         rows.extend(selected)
         sheet_name = f"第{index}组"[:31]
@@ -403,8 +440,8 @@ def split_schedule_by_room_groups(input_path, output_path, header_row, rules, se
             row[staff_col] = staff
             records.append(row)
         for index, group in enumerate(groups, start=1):
-            group_set = set(group)
-            selected = [row for row in records if row[room_col] in group_set]
+            group_set = {_room_key(room) for room in group}
+            selected = [row for row in records if _room_key(row[room_col]) in group_set]
             rows = [sheet.row_values(row_index) for row_index in range(header_row + 1)]
             rows.extend(selected)
             name = f"{sheet.name}-第{index}组"[:31]
@@ -429,27 +466,41 @@ def _split_schedule_by_room_groups_xlsx(input_path, output_path, header_row, rul
             continue
         headers = [cell.value for cell in sheet[header_row + 1]]
         room_col = _find_column(headers, ["教室编号", "考场号", "room"])
-        if room_col is None:
+        staff_col = _find_column(headers, ["监考人员", "监考教师", "staff", "proctor"])
+        if room_col is None or staff_col is None:
             continue
         rows = []
         previous_room = ""
+        previous_staff = ""
         for row_index in range(header_row + 2, sheet.max_row + 1):
             values = [sheet.cell(row_index, col).value for col in range(1, sheet.max_column + 1)]
             room = str(values[room_col] or "").strip() or previous_room
+            staff = str(values[staff_col] or "").strip() or previous_staff
             if room:
                 previous_room = room
+            if staff:
+                previous_staff = staff
             values[room_col] = room
-            rows.append((room, values))
+            values[staff_col] = staff
+            rows.append((room, values, row_index))
         for index, group in enumerate(groups, start=1):
             output_sheet = workbook.create_sheet(f"{sheet.title}-第{index}组"[:31])
+            _copy_xlsx_dimensions(sheet, output_sheet)
             for row_index in range(1, header_row + 2):
                 for col_index in range(1, sheet.max_column + 1):
                     source_cell = sheet.cell(row_index, col_index)
-                    output_sheet.cell(row_index, col_index, source_cell.value)
-            selected = [values for room, values in rows if room in set(group)]
-            for offset, values in enumerate(selected, start=header_row + 2):
+                    target_cell = output_sheet.cell(row_index, col_index, source_cell.value)
+                    _copy_xlsx_cell(source_cell, target_cell)
+            for merged in sheet.merged_cells.ranges:
+                if merged.max_row <= header_row + 1:
+                    output_sheet.merge_cells(str(merged))
+            group_set = {_room_key(room) for room in group}
+            selected = [(values, source_row) for room, values, source_row in rows if _room_key(room) in group_set]
+            for offset, (values, source_row) in enumerate(selected, start=header_row + 2):
                 for col_index, value in enumerate(values, start=1):
-                    output_sheet.cell(offset, col_index, value)
+                    target_cell = output_sheet.cell(offset, col_index, value)
+                    _copy_xlsx_cell(sheet.cell(source_row, col_index), target_cell)
+                _set_xlsx_staff_cell(output_sheet, output_sheet.cell(offset, staff_col + 1), values[staff_col])
             if not selected:
                 output_sheet.cell(header_row + 2, 1, f"未找到匹配考场：{','.join(group)}")
             total += 1

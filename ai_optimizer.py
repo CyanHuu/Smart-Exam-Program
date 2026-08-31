@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from datetime import timedelta
 from io import StringIO
 import re
+from time import perf_counter
 
 from ortools.sat.python import cp_model
 
@@ -24,6 +25,7 @@ DEFAULT_POLICY = {
     "stability_weight": 100,
     "backup_count": 2,
     "max_formal_count": None,
+    "max_total_count": None,
     "consecutive_gap_minutes": 120,
     "time_limit_seconds": 20,
     "random_seed": 7,
@@ -56,6 +58,13 @@ def normalise_policy(policy=None):
             raise ValueError("max_formal_count不能为负数")
     else:
         result["max_formal_count"] = None
+    total_maximum = result.get("max_total_count")
+    if total_maximum not in (None, ""):
+        result["max_total_count"] = int(total_maximum)
+        if result["max_total_count"] < 0:
+            raise ValueError("max_total_count不能为负数")
+    else:
+        result["max_total_count"] = None
     for key in ("unavailable", "avoid_rooms", "allow_consecutive"):
         result[key] = dict(result.get(key) or {})
     return result
@@ -89,6 +98,8 @@ def teacher_constraints(teacher_df, policy=None):
             raise ValueError(f"教师 {teacher_id} 的最多正式监考次数不能为负数")
         if policy["max_formal_count"] is not None:
             maximum = min(maximum, policy["max_formal_count"]) if maximum is not None else policy["max_formal_count"]
+        if policy["max_total_count"] is not None:
+            maximum = min(maximum, policy["max_total_count"]) if maximum is not None else policy["max_total_count"]
         unavailable = _items(row.get("unavailable_sessions_col", ""))
         unavailable.update(map(str, policy["unavailable"].get(teacher_id, [])))
         avoid_rooms = _items(row.get("avoid_rooms_col", ""))
@@ -100,6 +111,7 @@ def teacher_constraints(teacher_df, policy=None):
             "unavailable": unavailable,
             "avoid_rooms": avoid_rooms,
             "max_formal_count": maximum,
+            "max_total_count": policy["max_total_count"],
             "allow_consecutive": allow,
         }
     return constraints
@@ -157,6 +169,64 @@ def optimise_exam_sessions(
     if unknown_absent:
         raise ValueError(f"未知请假教师: {', '.join(sorted(unknown_absent))}")
     locked_session_ids = set(map(str, locked_session_ids or ()))
+
+    sessions_do_not_overlap = not any(
+        periods_overlap(sessions[left], sessions[right])
+        for left in range(len(sessions)) for right in range(left + 1, len(sessions))
+    )
+    each_session_has_capacity = all(
+        sum(needed for _, needed in session["rooms"]) <= len(teachers)
+        for session in sessions
+    )
+    unrestricted = (
+        not unavailable_teacher_ids and not previous_results and not locked_session_ids
+        and sessions_do_not_overlap and each_session_has_capacity
+        and all(
+            not rule["unavailable"] and not rule["avoid_rooms"]
+            and rule["max_formal_count"] is None and rule["max_total_count"] is None and rule["allow_consecutive"]
+            for rule in limits.values()
+        )
+    )
+    if unrestricted:
+        started = perf_counter()
+        counts = defaultdict(int)
+        results = {}
+        for session in sorted(sessions, key=lambda value: value["start"]):
+            used = set()
+            assignments = {}
+            for room, needed in session["rooms"]:
+                room = str(room)
+                current = []
+                first_candidates = [teacher for teacher in teachers if teacher[0] not in used and teacher[2]]
+                first_candidates = first_candidates or [teacher for teacher in teachers if teacher[0] not in used]
+                if first_candidates:
+                    first_teacher = min(first_candidates, key=lambda teacher: (counts[teacher[0]], teacher[0]))
+                    current.append(first_teacher)
+                    used.add(first_teacher[0])
+                    counts[first_teacher[0]] += 1
+                while len(current) < int(needed):
+                    candidates = [teacher for teacher in teachers if teacher[0] not in used]
+                    if not candidates:
+                        break
+                    teacher = min(candidates, key=lambda item: (counts[item[0]], item[2], item[0]))
+                    current.append(teacher)
+                    used.add(teacher[0])
+                    counts[teacher[0]] += 1
+                assignments[room] = current
+            results[str(session["session_id"])] = {"session": session, "assignments": assignments, "backups": {}}
+        _assign_backups(results, sessions, teachers, limits, policy["backup_count"])
+        for result in results.values():
+            result["report"] = _session_report(result, policy["backup_count"])
+        metrics = schedule_metrics(results, teachers, limits)
+        metrics["backup_shortage"] = sum(
+            result["report"]["backup_shortage"] for result in results.values()
+        )
+        metrics.update({
+            "solver_status": "FAST_GREEDY",
+            "objective_value": 0,
+            "wall_time_seconds": round(perf_counter() - started, 3),
+        })
+        return results, metrics
 
     model = cp_model.CpModel()
     formal, first = {}, {}
@@ -226,7 +296,7 @@ def optimise_exam_sessions(
         and sessions_do_not_overlap and each_session_has_capacity
         and all(
             not rule["unavailable"] and not rule["avoid_rooms"]
-            and rule["max_formal_count"] is None and rule["allow_consecutive"]
+            and rule["max_formal_count"] is None and rule["max_total_count"] is None and rule["allow_consecutive"]
             for rule in limits.values()
         )
     )
@@ -250,7 +320,6 @@ def optimise_exam_sessions(
                 consecutive_both.append(both)
 
     previous_formal = set()
-    previous_backups = set()
     if previous_results:
         session_index = {str(session["session_id"]): index for index, session in enumerate(sessions)}
         for session_id, result in previous_results.items():
@@ -259,8 +328,6 @@ def optimise_exam_sessions(
             s = session_index[str(session_id)]
             for room, room_teachers in result.get("assignments", {}).items():
                 previous_formal.update((teacher[0], s, str(room)) for teacher in room_teachers)
-            for room, room_teachers in result.get("backups", {}).items():
-                previous_backups.update((teacher[0], s, str(room)) for teacher in room_teachers)
         for s, session in enumerate(sessions):
             if str(session["session_id"]) not in locked_session_ids:
                 continue
@@ -268,6 +335,18 @@ def optimise_exam_sessions(
                 for teacher in teachers:
                     teacher_id = teacher[0]
                     model.add(formal[teacher_id, s, room] == int((teacher_id, s, room) in previous_formal))
+
+        # 稳定性是硬约束：旧正式安排只要不违反本次不可用/回避条件，就必须保留。
+        # 只有受影响教师或新硬约束冲突时，才允许重新分配。
+        for teacher_id, s, room in previous_formal:
+            key = (teacher_id, s, room)
+            if key not in formal:
+                continue
+            session_id = str(sessions[s]["session_id"])
+            rule = limits[teacher_id]
+            if teacher_id in unavailable_teacher_ids or session_id in rule["unavailable"] or room in rule["avoid_rooms"]:
+                continue
+            model.add(formal[key] == 1)
 
     # 现有贪心算法能在毫秒级给出可执行方案，用它热启动 CP-SAT，避免大数据从零搜索。
     try:
@@ -332,14 +411,10 @@ def optimise_exam_sessions(
         for t in teachers if t[2] == 1
         for s, rooms in enumerate(session_rooms) for room, _ in rooms
     )
-    keep_formal = sum(formal[key] for key in previous_formal if key in formal)
-    promote_backup = sum(formal[key] for key in previous_backups if key in formal)
     soft_reward = (
         experienced_first * policy["experience_weight"]
         + sum(gender_mix) * policy["gender_weight"]
         + sum(department_mix) * policy["department_weight"]
-        + keep_formal * policy["stability_weight"] * 20
-        + promote_backup * policy["stability_weight"]
     )
     model.minimize(shortage_cost + fairness_cost + consecutive_cost - soft_reward)
 
@@ -397,6 +472,7 @@ def _assign_backups(
             for teacher in items:
                 assigned_times[teacher[0]].append(result["session"])
                 formal_counts[teacher[0]] += 1
+    total_counts = defaultdict(int, formal_counts)
 
     previous_lookup = {}
     for session_id, result in (previous_results or {}).items():
@@ -423,13 +499,40 @@ def _assign_backups(
                     return True
         return False
 
+    tasks = []
     for session in sorted(sessions, key=lambda value: value["start"]):
         session_id = str(session["session_id"])
         result = results[session_id]
         result["backups"] = {}
         for room, _ in session["rooms"]:
-            room = str(room)
+            tasks.append((session, session_id, str(room)))
+            result["backups"][str(room)] = []
+
+    # ponytail: round-robin backup allocation; replace with weighted matching only if backup fairness needs optimisation.
+    for backup_index in range(backup_count):
+        # 只要还有任何考场没有备选人员，就先停止追加第二名，避免备选集中在少数考场。
+        if backup_index and any(
+            min(backup_count, len(results[session_id]["assignments"].get(room, []))) > 0
+            and not results[session_id]["backups"][room]
+            for _, session_id, room in tasks
+        ):
+            break
+        # 每一轮只给尚未覆盖的考场补一个备选，且先处理候选人更少的考场，最大化覆盖面。
+        def available_count(task):
+            session, _, room = task
+            return sum(
+                not unavailable_for_task(teacher[0], session, room)
+                and (limits[teacher[0]]["max_total_count"] is None
+                     or total_counts[teacher[0]] < limits[teacher[0]]["max_total_count"])
+                for teacher in teachers
+            )
+
+        for session, session_id, room in sorted(tasks, key=available_count):
+            result = results[session_id]
             current = result["assignments"][room]
+            target_count = min(backup_count, len(current))
+            if len(result["backups"][room]) >= target_count:
+                continue
             genders = {teacher[3] for teacher in current}
             departments = {teacher[4] for teacher in current}
             preferred = previous_lookup.get((session_id, room), [])
@@ -445,13 +548,17 @@ def _assign_backups(
                 )
 
             candidates = sorted(
-                (teacher for teacher in teachers if not unavailable_for_task(teacher[0], session, room)),
+                (teacher for teacher in teachers
+                 if not unavailable_for_task(teacher[0], session, room)
+                 and (limits[teacher[0]]["max_total_count"] is None
+                      or total_counts[teacher[0]] < limits[teacher[0]]["max_total_count"])),
                 key=rank,
             )
-            selected = candidates[:backup_count]
-            result["backups"][room] = selected
-            for teacher in selected:
-                assigned_times[teacher[0]].append(session)
+            if candidates:
+                selected = candidates[0]
+                result["backups"][room].append(selected)
+                assigned_times[selected[0]].append(session)
+                total_counts[selected[0]] += 1
 
 
 def _session_report(result, backup_count):
@@ -463,6 +570,10 @@ def _session_report(result, backup_count):
         assigned = len(assignments.get(str(room), []))
         if assigned < needed:
             unfilled.append({"room": str(room), "needed": needed, "assigned": assigned, "missing": needed - assigned})
+    backup_shortage = sum(
+        max(0, min(backup_count, len(assignments.get(str(room), []))) - len(backups.get(str(room), [])))
+        for room, _ in rooms
+    )
     return {
         "total_rooms": len(rooms),
         "total_needed": sum(needed for _, needed in rooms),
@@ -470,7 +581,7 @@ def _session_report(result, backup_count):
         "shortage": sum(item["missing"] for item in unfilled),
         "unfilled_rooms": unfilled,
         "backup_total": sum(map(len, backups.values())),
-        "backup_shortage": sum(max(0, backup_count - len(items)) for items in backups.values()),
+        "backup_shortage": backup_shortage,
         "experience_first_count": sum(bool(items and items[0][2]) for items in assignments.values()),
         "gender_mix_count": sum(len({t[3] for t in items}) > 1 for items in assignments.values()),
         "department_mix_count": sum(len({t[4] for t in items}) > 1 for items in assignments.values()),

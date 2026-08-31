@@ -4,11 +4,17 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
 import hmac
+import json
 import os
+import re
 from pathlib import Path
 import shutil
+import socket
+import ssl
 import tempfile
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
@@ -49,6 +55,7 @@ class PolicyModel(BaseModel):
     stability_weight: int = Field(100, ge=0)
     backup_count: int = Field(2, ge=0, le=5)
     max_formal_count: int | None = Field(None, ge=0)
+    max_total_count: int | None = Field(None, ge=0)
     consecutive_gap_minutes: int = Field(120, ge=0, le=1440)
     time_limit_seconds: int = Field(20, ge=1, le=120)
     random_seed: int = 7
@@ -61,15 +68,25 @@ class DatasetRequest(BaseModel):
     dataset_id: str
 
 
+class AiPolicyRequest(BaseModel):
+    dataset_id: str
+    instruction: str = Field(min_length=1, max_length=2000)
+    current_policy: dict = Field(default_factory=dict)
+    schedule_id: str | None = None
+    conversation: list[dict] = Field(default_factory=list, max_length=20)
+
+
 class PolicyRequest(DatasetRequest):
     policy: PolicyModel = Field(default_factory=PolicyModel)
 
 
 class ReplanRequest(BaseModel):
     schedule_id: str
-    unavailable_teacher_ids: list[str] = Field(min_length=1)
+    unavailable_teacher_ids: list[str] = Field(default_factory=list)
+    unavailable_by_session: dict[str, list[str]] = Field(default_factory=dict)
     affected_session_ids: list[str] = Field(default_factory=list)
     policy: PolicyModel = Field(default_factory=PolicyModel)
+    preview: bool = False
 
 
 class ExportRequest(BaseModel):
@@ -129,6 +146,245 @@ def _schedule(schedule_id):
     if not value:
         raise HTTPException(status_code=404, detail="排考方案不存在或已过期")
     return value
+
+
+def _natural_session_ids(instruction, sessions):
+    """从自然语言时间筛选真实场次，避免模型把年月数字误当成场次ID。"""
+    month_words = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+    month_match = re.search(r"(?:(\d{4})\s*年)?\s*(\d{1,2}|十一|十二|十|[一二三四五六七八九])\s*月", instruction)
+    day_match = re.search(r"(?:(\d{1,2})\s*月\s*)?(\d{1,2})\s*(?:日|号)", instruction)
+    weekday_match = re.search(r"(?:周|星期)([一二三四五六日天7])", instruction)
+    month = int(month_match.group(2)) if month_match and month_match.group(2).isdigit() else month_words.get(month_match.group(2)) if month_match else None
+    year = int(month_match.group(1)) if month_match and month_match.group(1) else None
+    weekday = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6, "7": 6}.get(weekday_match.group(1)) if weekday_match else None
+    morning = "上午" in instruction or "早上" in instruction
+    afternoon = "下午" in instruction or "晚上" in instruction
+    selected = []
+    for session in sessions:
+        start = session["start"]
+        if year and start.year != year:
+            continue
+        if month and start.month != month:
+            continue
+        if day_match:
+            day_month = int(day_match.group(1)) if day_match.group(1) else None
+            day = int(day_match.group(2))
+            if day_month and start.month != day_month:
+                continue
+            if start.day != day:
+                continue
+        if weekday is not None and start.weekday() != weekday:
+            continue
+        if morning and start.hour >= 12:
+            continue
+        if afternoon and start.hour < 12:
+            continue
+        if month or day_match or weekday is not None:
+            selected.append(str(session["session_id"]))
+    return selected
+
+
+def _natural_teacher_ids(instruction, teacher_df):
+    known = {str(row["id_col"]).strip(): str(row["name_col"]).strip() for _, row in teacher_df.iterrows()}
+    ids = {teacher_id for teacher_id in known if teacher_id in instruction}
+    ids.update(teacher_id for teacher_id, name in known.items() if name and name in instruction)
+    batch_words = ("所有", "全部", "全体", "批量", "每位", "每个")
+    has_batch_scope = any(word in instruction for word in batch_words)
+    all_teacher_scope = has_batch_scope and bool(re.search(r"(?:所有|全部|全体)\s*(?:的)?\s*(?:老师|教师|人员)", instruction))
+    male_scope = bool(re.search(r"男(?:性|生|老师|教师|的)?", instruction))
+    female_scope = bool(re.search(r"女(?:性|生|老师|教师|的)?", instruction))
+    experienced_scope = bool(re.search(r"有经验|经验丰富|资深|熟悉排考", instruction))
+    inexperienced_scope = bool(re.search(r"无经验|没有经验|经验不足", instruction))
+    for _, row in teacher_df.iterrows():
+        teacher_id = str(row["id_col"]).strip()
+        department = str(row.get("dept_col", "")).strip()
+        department_stem = re.split(r"学院|专业|教研室|系|部", department)[0].strip()
+        department_match = bool(department and (department in instruction or len(department_stem) >= 2 and department_stem in instruction))
+        gender = str(row.get("gender_col", "")).strip().lower()
+        is_male = gender in {"1", "男", "male", "m"}
+        is_experienced = str(row.get("experience_col", "")).strip().lower() in {"1", "是", "有", "有经验", "yes", "true"}
+        attribute_match = (
+            (male_scope and is_male) or (female_scope and not is_male)
+            or (experienced_scope and is_experienced) or (inexperienced_scope and not is_experienced)
+        )
+        if all_teacher_scope or (has_batch_scope and (department_match or attribute_match)) or (attribute_match and "老师" in instruction):
+            ids.add(teacher_id)
+    return sorted(ids)
+
+
+def _agnes_policy(dataset, instruction, current_policy=None, schedule_id=None, conversation=None):
+    """把自然语言排考要求转换成 policy；最终排考仍由本地 OR-Tools 完成。"""
+    api_key = os.getenv("AGNES_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="未配置 AGNES_API_KEY")
+
+    teachers = [
+        {
+            "teacher_id": str(row["id_col"]).strip(),
+            "name": str(row["name_col"]).strip(),
+            "department": str(row.get("dept_col", "")).strip(),
+            "gender": "男" if str(row.get("gender_col", "")).strip().lower() in {"1", "男", "male", "m"} else "女",
+            "experienced": str(row.get("experience_col", 0)).strip().lower() in {"1", "是", "有", "有经验", "yes", "true"},
+        }
+        for _, row in dataset["teacher_df"].iterrows()
+    ]
+    sessions = [
+        {
+            "session_id": str(session["session_id"]),
+            "period": session.get("period_text", ""),
+            "start": session["start"].isoformat(),
+            "end": session["end"].isoformat(),
+            "rooms": [str(room) for room, _ in session.get("rooms", [])],
+        }
+        for session in dataset["sessions"]
+    ]
+    policy_fields = set(normalise_policy())
+    current_raw = normalise_policy(current_policy or {})
+    current = {key: current_raw[key] for key in policy_fields}
+    scheduled = _schedule(schedule_id) if schedule_id else None
+    history = [
+        str(item.get("content", "")).strip()[:2000]
+        for item in (conversation or [])
+        if isinstance(item, dict) and item.get("role") == "user" and str(item.get("content", "")).strip()
+    ][-20:]
+    conversation_text = "\n".join((history + [instruction])[-20:])
+    prompt = f"""
+请先判断用户意图，再只输出一个 JSON 对象，不要 Markdown。
+你是排考助手，不是通用聊天机器人，也不能直接生成教师安排。
+intent 只能是 policy、question、replan 或 unsupported：
+- policy：用户要新增或修改排考规则，返回 policy 修改补丁；
+- question：用户在询问排考规则或排考流程，返回简短 answer，不修改 policy；
+- replan：用户说明某位教师在某个日期、时间或场次有事，返回 teacher_ids、affected_session_ids、reason 和 answer；不能直接修改排考结果；
+- question：用户在询问排考规则或排考流程，必须依据“当前已有 policy”回答，返回简短 answer，不修改 policy；
+- 用户询问“当前优先级”时，只展示经验匹配、男女搭配、部门均衡、公平分配这四个主优先级及其相对顺序；稳定性是默认硬性条件，不参与优先级排序；连续监考惩罚、备选人数等属于约束或辅助参数。
+- 用户询问“备选监考/备用人员规则”时，说明默认备选人数不超过该考场正式监考人数（1名正式对应1名备选，2名正式对应2名备选），并先覆盖所有考场再追加名额；候选教师必须满足时间和总任务量限制，不得把备选规则回答成正式监考规则。
+- unsupported：与排考无关，answer 必须是“我只能协助处理排考规则、排考安排和教师调度问题。”。
+只能使用上下文中存在的教师工号、考试场次ID和考场编号。
+这是一次连续对话。已有排考规则必须保留；只在用户本次明确修改时返回对应字段，没有修改的字段不要改变。
+当用户调整“优先级”或说“更重视/降低某项”时，通过 experience_weight、gender_weight、department_weight 和 fairness_weight 重新分配权重；权重越大表示越优先。
+当用户说“总任务量/总次数不超过N次”时，只修改 max_total_count；总任务量包含正式监考和备选待命。只有用户明确说“正式监考次数”时才修改 max_formal_count。
+若同名教师无法唯一确定，返回 clarification_required=true，并在 message 说明需要确认。
+如果用户表达“某老师周三上午有事”“工号01395第二场不能监考”等自然语言，请结合教师和场次上下文识别对应工号与场次；无法唯一对应时必须请求确认。
+如果用户表达“所有/全部/批量 + 某部门/专业/学院/性别/经验条件 + 教师”，必须识别符合条件的全部教师工号，返回批量 teacher_ids；不要只返回一个教师，也不要要求用户逐个输入工号。当前教师字段包括工号、姓名、性别、是否有经验、部门。
+
+JSON 顶层格式：
+{{"intent": "policy", "clarification_required": false, "message": "", "answer": "", "teacher_ids": [], "affected_session_ids": [], "reason": "", "policy": {{...}}}}
+
+policy 必须包含这些字段：
+experience_weight, gender_weight, department_weight, fairness_weight,
+consecutive_penalty, stability_weight, backup_count, max_formal_count, max_total_count,
+consecutive_gap_minutes, time_limit_seconds, random_seed,
+unavailable, avoid_rooms, allow_consecutive。
+
+当前已有 policy：{json.dumps(current, ensure_ascii=False)}
+教师上下文：{json.dumps(teachers, ensure_ascii=False)}
+考试场次上下文：{json.dumps(sessions, ensure_ascii=False)}
+已有排考方案：{json.dumps(bool(scheduled), ensure_ascii=False)}
+本次对话中用户之前的要求（仅用于补全省略的教师、时间和场次，不要重复执行已完成的规则）：{conversation_text}
+用户要求：{instruction}
+"""
+    base_url = os.getenv("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
+    payload = json.dumps({
+        "model": os.getenv("AGNES_MODEL", "agnes-2.5-flash"),
+        "messages": [
+            {"role": "system", "content": "严格遵守用户输入中的 JSON 输出要求。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": 2000,
+    }).encode("utf-8")
+    request = Request(
+        f"{base_url}/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        result = None
+        timeout = int(os.getenv("AGNES_TIMEOUT_SECONDS", "180"))
+        for attempt in range(2):
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                break
+            except (ssl.SSLError, ConnectionResetError) as exc:
+                if attempt == 1:
+                    raise exc
+    except (HTTPError, URLError, TimeoutError, socket.timeout) as exc:
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            detail = "Agnes AI响应超时，请稍后重试；也可以设置 AGNES_TIMEOUT_SECONDS 延长等待时间"
+        else:
+            detail = f"Agnes API调用失败：{exc}"
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except (ssl.SSLError, ConnectionResetError) as exc:
+        raise HTTPException(status_code=502, detail="Agnes HTTPS连接被中断，请检查代理/VPN后重试") from exc
+
+    try:
+        content = result["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.strip("`").removeprefix("json").strip()
+        parsed = json.loads(content)
+        natural_teacher_ids = _natural_teacher_ids(conversation_text, dataset["teacher_df"])
+        natural_session_ids = _natural_session_ids(conversation_text, dataset["sessions"])
+        unavailable_language = re.search(r"有事|旅游|请假|休假|出差|不能监考|无法监考|不能工作|无法工作|不参加|不可用|不工作|没空|没时间|无法参加|不方便", conversation_text)
+        # Agnes 可能因批量部门表达式不熟悉而先要求澄清；只要本地已识别出
+        # 批量教师和调度意图，就继续走确定性的批量预览流程。
+        if parsed.get("clarification_required") and not (natural_teacher_ids and unavailable_language):
+            return parsed
+        if parsed.get("intent") in {"question", "unsupported"} and not (natural_teacher_ids and unavailable_language):
+            return {
+                "intent": parsed["intent"],
+                "clarification_required": False,
+                "message": "",
+                "answer": parsed.get("answer") or "我只能协助处理排考规则、排考安排和教师调度问题。",
+                "policy": current,
+            }
+        if parsed.get("intent") == "replan" or (natural_teacher_ids and unavailable_language):
+            teacher_ids = [str(value) for value in parsed.get("teacher_ids", [])]
+            session_ids = [str(value) for value in parsed.get("affected_session_ids", [])]
+            teacher_ids = sorted(set(teacher_ids) | set(natural_teacher_ids))
+            if natural_session_ids:
+                session_ids = natural_session_ids
+            known_teachers = {str(row["id_col"]).strip() for _, row in dataset["teacher_df"].iterrows()}
+            known_sessions = {str(session["session_id"]) for session in dataset["sessions"]}
+            unknown_teachers = sorted(set(teacher_ids) - known_teachers)
+            unknown_sessions = sorted(set(session_ids) - known_sessions)
+            if not scheduled:
+                raise HTTPException(status_code=422, detail="请先完成一次排考，再处理教师调度需求")
+            if unknown_teachers or unknown_sessions or not teacher_ids or not session_ids:
+                if not teacher_ids:
+                    message = "我还不能唯一确定您说的是哪位教师，请补充教师姓名、工号或部门。"
+                elif not session_ids:
+                    message = f"我已识别到 {len(teacher_ids)} 名教师，请再告诉我具体日期、月份、星期或考试场次。"
+                else:
+                    message = "教师或场次没有对应到当前排考数据，请补充更准确的教师工号、日期或场次。"
+                return {"intent": "replan", "clarification_required": True, "message": message, "answer": message, "teacher_ids": teacher_ids, "affected_session_ids": session_ids, "reason": "", "policy": current}
+            return {
+                "intent": "replan",
+                "clarification_required": False,
+                "message": "",
+                "answer": parsed.get("answer") or "已识别到教师调度需求，请确认受影响场次后重新排考。",
+                "teacher_ids": sorted(set(teacher_ids)),
+                "affected_session_ids": sorted(set(session_ids)),
+                "reason": parsed.get("reason", "教师临时不可用"),
+                "policy": current,
+            }
+        raw_policy = parsed.get("policy", {})
+        if not isinstance(raw_policy, dict):
+            raise ValueError("policy 必须是对象")
+        merged = dict(current)
+        allowed = policy_fields
+        merged.update({key: raw_policy[key] for key in allowed if key in raw_policy})
+        policy = normalise_policy(merged)
+        errors = validate_policy_references(dataset["sessions"], dataset["teacher_df"], policy)
+        if errors:
+            raise HTTPException(status_code=422, detail="；".join(errors))
+        return {"intent": "policy", "clarification_required": False, "message": "", "answer": "", "policy": policy}
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Agnes返回的规则格式无效：{exc}") from exc
 
 
 def _teacher_json(teacher):
@@ -198,7 +454,11 @@ def login(request: LoginRequest):
     admin_username = os.getenv("ADMIN_USERNAME", "admin")
     admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
     if hmac.compare_digest(request.username, admin_username) and hmac.compare_digest(request.password, admin_password):
-        return {"role": "admin", "display_name": "排考老师"}
+        schedule_id = next(
+            (key for key, _ in sorted(SCHEDULES.items(), key=lambda pair: pair[1]["created_at"], reverse=True)),
+            None,
+        )
+        return {"role": "admin", "display_name": "排考老师", "schedule_id": schedule_id}
     datasets = sorted(DATASETS.items(), key=lambda pair: pair[1]["created_at"], reverse=True)
     for dataset_id, dataset in datasets:
         teacher_df = dataset["teacher_df"]
@@ -260,6 +520,11 @@ def validate_policy(request: PolicyRequest):
     return {"valid": not errors, "errors": errors, "policy": normalise_policy(policy)}
 
 
+@app.post("/api/v1/ai/parse-policy", dependencies=[Depends(require_api_key)])
+def parse_ai_policy(request: AiPolicyRequest):
+    return _agnes_policy(_dataset(request.dataset_id), request.instruction, request.current_policy, request.schedule_id, request.conversation)
+
+
 @app.post("/api/v1/schedules/solve", dependencies=[Depends(require_api_key)])
 def solve_schedule(request: PolicyRequest):
     dataset = _dataset(request.dataset_id)
@@ -298,7 +563,12 @@ def replan_schedule(request: ReplanRequest):
     previous = _schedule(request.schedule_id)
     dataset = _dataset(previous["dataset_id"])
     absent = set(map(str, request.unavailable_teacher_ids))
+    unavailable_by_session = {
+        str(session_id): [str(teacher_id) for teacher_id in teacher_ids]
+        for session_id, teacher_ids in request.unavailable_by_session.items()
+    }
     affected = set(map(str, request.affected_session_ids))
+    affected.update(unavailable_by_session)
     for session_id, result in previous["results"].items():
         if any(teacher[0] in absent for source in (result["assignments"], result.get("backups", {})) for items in source.values() for teacher in items):
             affected.add(str(session_id))
@@ -306,9 +576,21 @@ def replan_schedule(request: ReplanRequest):
     unknown = affected - all_sessions
     if unknown:
         raise HTTPException(status_code=422, detail=f"未知受影响场次: {', '.join(sorted(unknown))}")
+    all_teachers = {str(value) for value in dataset["teacher_df"]["id_col"].tolist()}
+    unknown_scoped = {
+        teacher_id for teacher_ids in unavailable_by_session.values() for teacher_id in teacher_ids
+    } - all_teachers
+    if unknown_scoped:
+        raise HTTPException(status_code=422, detail=f"未知调度教师: {', '.join(sorted(unknown_scoped))}")
+    policy_data = request.policy.model_dump()
+    scoped_unavailable = dict(policy_data.get("unavailable", {}))
+    for session_id, teacher_ids in unavailable_by_session.items():
+        for teacher_id in teacher_ids:
+            scoped_unavailable.setdefault(teacher_id, []).append(session_id)
+    policy_data["unavailable"] = scoped_unavailable
     try:
         replanned, metrics = optimise_exam_sessions(
-            dataset["sessions"], dataset["teacher_df"], request.policy.model_dump(),
+            dataset["sessions"], dataset["teacher_df"], policy_data,
             previous_results=previous["results"], unavailable_teacher_ids=absent,
             locked_session_ids=all_sessions - affected,
         )
@@ -317,12 +599,13 @@ def replan_schedule(request: ReplanRequest):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     schedule_id = uuid4().hex
     changes = _changed_assignments(previous["results"], replanned)
-    SCHEDULES[schedule_id] = {
-        "dataset_id": previous["dataset_id"], "created_at": time.time(), "results": replanned,
-        "baseline": previous["baseline"], "policy": request.policy.model_dump(), "metrics": metrics,
-    }
+    if not request.preview:
+        SCHEDULES[schedule_id] = {
+            "dataset_id": previous["dataset_id"], "created_at": time.time(), "results": replanned,
+            "baseline": previous["baseline"], "policy": policy_data, "metrics": metrics,
+        }
     return {
-        "schedule_id": schedule_id, "affected_session_ids": sorted(affected),
+        "schedule_id": request.schedule_id if request.preview else schedule_id, "affected_session_ids": sorted(affected),
         "changed_rooms": len(changes), "changes": changes, "metrics": metrics,
         "workload": list(workload.values()),
         "explanation_facts": assignment_reasons(replanned, dataset["teacher_df"]),

@@ -71,6 +71,22 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(metrics["shortage"], 1)
         self.assertEqual(len({teacher[0] for teacher in assigned}), 1)
 
+    def test_backups_are_distributed_before_second_backup(self):
+        one_session = [dict(sessions()[0], rooms=[("R1", 1), ("R2", 1)])]
+        results, _ = optimise_exam_sessions(
+            one_session, teachers(), {"backup_count": 1, "time_limit_seconds": 5}
+        )
+        self.assertEqual(len(results["S1"]["backups"]["R1"]), 1)
+        self.assertEqual(len(results["S1"]["backups"]["R2"]), 1)
+
+    def test_backup_target_follows_formal_count(self):
+        one_session = [dict(sessions()[0], rooms=[("R1", 2)])]
+        results, _ = optimise_exam_sessions(
+            one_session, teachers(), {"backup_count": 2, "time_limit_seconds": 5}
+        )
+        self.assertEqual(len(results["S1"]["assignments"]["R1"]), 2)
+        self.assertEqual(len(results["S1"]["backups"]["R1"]), 2)
+
     def test_replan_locks_unaffected_sessions(self):
         before, _ = optimise_exam_sessions(sessions(), teachers(), {"backup_count": 0, "time_limit_seconds": 5})
         absent = before["S1"]["assignments"]["R1"][0][0]
@@ -81,6 +97,18 @@ class OptimizerTests(unittest.TestCase):
         )
         self.assertNotIn(absent, {teacher[0] for teacher in after["S1"]["assignments"]["R1"]})
         self.assertEqual(unchanged, [teacher[0] for teacher in after["S2"]["assignments"]["R1"]])
+
+    def test_stability_keeps_non_conflicting_assignments_in_affected_session(self):
+        before, _ = optimise_exam_sessions(sessions(), teachers(), {"backup_count": 0, "time_limit_seconds": 5})
+        original = [teacher[0] for teacher in before["S1"]["assignments"]["R1"]]
+        absent = original[0]
+        after, _ = optimise_exam_sessions(
+            sessions(), teachers(), {"backup_count": 0, "time_limit_seconds": 5},
+            previous_results=before, unavailable_teacher_ids=[absent], locked_session_ids=[],
+        )
+        current = {teacher[0] for teacher in after["S1"]["assignments"]["R1"]}
+        self.assertNotIn(absent, current)
+        self.assertIn(original[1], current)
 
 
 if __name__ == "__main__":
