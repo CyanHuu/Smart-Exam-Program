@@ -647,7 +647,7 @@ def export_schedule_groups(request: GroupExportRequest):
     output_path = dataset["directory"] / f"智能排考_{request.schedule_id[:8]}_分组{suffix}"
     try:
         write_session_assignments_to_excel(
-            schedule["results"], str(dataset["schedule_path"]), header_row=2, output_path=str(full_path)
+            schedule["results"], str(dataset["schedule_path"]), header_row=2, output_path=str(full_path), add_staff_border=False
         )
         split_schedule_by_room_groups(str(full_path), str(output_path), header_row=2, rules=request.rules, session_ids=None if request.session_id == "__all__" else [request.session_id])
     except Exception as exc:

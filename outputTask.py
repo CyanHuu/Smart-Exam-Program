@@ -5,6 +5,7 @@ from copy import copy as copy_style
 import xlrd
 import xlwt
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Border, Side
 from xlutils.copy import copy
 
 
@@ -31,6 +32,12 @@ def _find_column(headers, keywords):
 
 def _room_key(value):
     return str(value or "").strip().casefold()
+
+
+def _pad_row(row, width):
+    """Excel 中允许数据行比表头短，统一补齐后再按列读取。"""
+    values = list(row)
+    return values + [""] * max(0, width - len(values))
 
 
 def _assignment_text(teachers):
@@ -68,18 +75,44 @@ def _set_staff_row_height(sheet, row_index, value, col_index=None, merged_cells=
         sheet.row(row).height = height
 
 
-def _set_xlsx_staff_cell(sheet, target, value):
+def _apply_xlsx_staff_border(sheet, target):
+    edge = Side(style="thin", color="000000")
+    for merged in sheet.merged_cells.ranges:
+        if not (merged.min_row <= target.row <= merged.max_row and merged.min_col <= target.column <= merged.max_col):
+            continue
+        for row in range(merged.min_row, merged.max_row + 1):
+            for column in range(merged.min_col, merged.max_col + 1):
+                cell = sheet.cell(row, column)
+                cell.border = Border(
+                    left=edge if column == merged.min_col else Side(),
+                    right=edge if column == merged.max_col else Side(),
+                    top=edge if row == merged.min_row else Side(),
+                    bottom=edge if row == merged.max_row else Side(),
+                )
+        return
+    target.border = Border(left=edge, right=edge, top=edge, bottom=edge)
+
+
+def _set_xlsx_staff_cell(sheet, target, value, add_border=True):
     target.value = value
     target.alignment = target.alignment.copy(wrap_text=True, vertical="center")
+    if add_border:
+        _apply_xlsx_staff_border(sheet, target)
     lines = max(1, str(value or "").count("\n") + 1)
     sheet.row_dimensions[target.row].height = max(22, min(120, 18 * lines))
 
 
 def _copy_xlsx_cell(source, target):
     if source.has_style:
-        target._style = copy_style(source._style)
-    if source.number_format:
-        target.number_format = source.number_format
+        # 不能直接复用源工作簿的 StyleArray；其中的字体/边框索引属于源工作簿，
+        # 在目标工作簿处理合并单元格时会触发 IndexError。逐项复制可让 openpyxl
+        # 在目标工作簿中重新注册这些样式。
+        target.font = copy_style(source.font)
+        target.fill = copy_style(source.fill)
+        target.border = copy_style(source.border)
+        target.alignment = copy_style(source.alignment)
+        target.protection = copy_style(source.protection)
+    target.number_format = source.number_format
     if source.hyperlink:
         target._hyperlink = copy_style(source.hyperlink)
     if source.comment:
@@ -141,11 +174,11 @@ def write_assignments_to_excel(assignments, input_output_path, header_row=2, out
     print(f"[OK] 监考安排已写入: {target_path}")
 
 
-def write_session_assignments_to_excel(schedule_results, input_output_path, header_row=2, output_path=None):
+def write_session_assignments_to_excel(schedule_results, input_output_path, header_row=2, output_path=None, add_staff_border=True):
     """按场次分别写入模板的多个工作表，并保留原始格式。"""
     target_path = output_path or input_output_path
     if str(input_output_path).lower().endswith(".xlsx"):
-        return write_session_assignments_to_xlsx(schedule_results, input_output_path, header_row, output_path)
+        return write_session_assignments_to_xlsx(schedule_results, input_output_path, header_row, output_path, add_staff_border)
     if output_path and output_path != input_output_path:
         try:
             shutil.copyfile(input_output_path, output_path)
@@ -183,7 +216,7 @@ def write_session_assignments_to_excel(schedule_results, input_output_path, head
     print(f"[OK] 多场次监考安排已写入: {target_path}")
 
 
-def write_session_assignments_to_xlsx(schedule_results, input_output_path, header_row=2, output_path=None):
+def write_session_assignments_to_xlsx(schedule_results, input_output_path, header_row=2, output_path=None, add_staff_border=True):
     target_path = output_path or input_output_path
     if output_path and output_path != input_output_path:
         shutil.copyfile(input_output_path, output_path)
@@ -209,7 +242,7 @@ def write_session_assignments_to_xlsx(schedule_results, input_output_path, heade
                         if target.coordinate in merged:
                             target = sheet.cell(merged.min_row, merged.min_col)
                             break
-                _set_xlsx_staff_cell(sheet, target, _assignment_text(result["assignments"][room]))
+                _set_xlsx_staff_cell(sheet, target, _assignment_text(result["assignments"][room]), add_staff_border)
     workbook.save(target_path)
     print(f"[OK] 多场次监考安排已写入: {target_path}")
 
@@ -267,7 +300,7 @@ def _load_schedule(input_path, header_row):
     previous_room = ""
     previous_staff = ""
     for row_index in range(header_row + 1, sheet.nrows):
-        row = list(sheet.row_values(row_index))
+        row = _pad_row(sheet.row_values(row_index), len(headers))
         room = _merged_or_cell_value(sheet, row_index, room_col) or previous_room
         staff = _merged_or_cell_value(sheet, row_index, staff_col) or previous_staff
         if room:
@@ -429,7 +462,7 @@ def split_schedule_by_room_groups(input_path, output_path, header_row, rules, se
         previous_room = ""
         previous_staff = ""
         for row_index in range(header_row + 1, sheet.nrows):
-            row = list(sheet.row_values(row_index))
+            row = _pad_row(sheet.row_values(row_index), len(headers))
             room = _merged_or_cell_value(sheet, row_index, room_col) or previous_room
             staff = _merged_or_cell_value(sheet, row_index, staff_col) or previous_staff
             if room:
@@ -473,7 +506,7 @@ def _split_schedule_by_room_groups_xlsx(input_path, output_path, header_row, rul
         previous_room = ""
         previous_staff = ""
         for row_index in range(header_row + 2, sheet.max_row + 1):
-            values = [sheet.cell(row_index, col).value for col in range(1, sheet.max_column + 1)]
+            values = _pad_row([sheet.cell(row_index, col).value for col in range(1, sheet.max_column + 1)], len(headers))
             room = str(values[room_col] or "").strip() or previous_room
             staff = str(values[staff_col] or "").strip() or previous_staff
             if room:
@@ -500,7 +533,6 @@ def _split_schedule_by_room_groups_xlsx(input_path, output_path, header_row, rul
                 for col_index, value in enumerate(values, start=1):
                     target_cell = output_sheet.cell(offset, col_index, value)
                     _copy_xlsx_cell(sheet.cell(source_row, col_index), target_cell)
-                _set_xlsx_staff_cell(output_sheet, output_sheet.cell(offset, staff_col + 1), values[staff_col])
             if not selected:
                 output_sheet.cell(header_row + 2, 1, f"未找到匹配考场：{','.join(group)}")
             total += 1
