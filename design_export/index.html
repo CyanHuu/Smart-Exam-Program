@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>智能排考系统 - 设计稿</title>
-  <link rel="stylesheet" href="./styles.css?v=5" />
+  <link rel="stylesheet" href="./styles.css?v=10" />
 </head>
 <body>
   <div id="loginView" class="login-view">
@@ -29,6 +29,7 @@
         <a class="nav-item admin-only" href="#workload" data-page="workload">查看教师工作量</a>
         <a class="nav-item teacher-only" href="#timeline" data-page="timeline">我的排考时间轴</a>
         <a class="nav-item" href="#dispatch" data-page="dispatch">智能调度</a>
+        <a class="nav-item admin-only" href="#dispatchRequests" data-page="dispatchRequests">调度请求中心</a>
         <a class="nav-item" href="#exports" data-page="exports">数据导出 / 分组导出</a>
       </nav>
       <div class="sidebar-footer">考务工作台</div>
@@ -101,6 +102,6 @@
       <section id="exports" class="panel page-section" data-page-section="exports"><div class="panel-title"><h2>数据导出 / 分组导出</h2></div><div class="export-options"><div class="export-card"><h3>数据导出</h3><p>下载包含全部考试场次和监考安排的完整 Excel 文件。</p><button id="exportButton2" class="outline-button">⇩ 导出完整数据</button></div><div class="export-card"><h3>分组导出</h3><p>选择全部日期或某个考试场次，再按考场范围生成分组工作表。</p><select id="exportSession" class="export-session"><option value="">请先完成排考</option></select><div class="group-export-control"><input id="groupRules" placeholder="例如：C101-C112 或 C101,C103,C105"><button id="groupExportButton" class="outline-button">▦ 导出分组数据</button></div></div></div><p id="exportMessage" class="export-message"></p></section>
     </main>
   </div>
-  <script src="./app.js?v=63"></script>
+  <script src="./app.js?v=67"></script>
 </body>
 </html>

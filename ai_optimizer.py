@@ -32,6 +32,8 @@ DEFAULT_POLICY = {
     "unavailable": {},
     "avoid_rooms": {},
     "allow_consecutive": {},
+    "returning_teacher_positions": [],
+    "restore_only_positions": [],
 }
 
 
@@ -67,6 +69,8 @@ def normalise_policy(policy=None):
         result["max_total_count"] = None
     for key in ("unavailable", "avoid_rooms", "allow_consecutive"):
         result[key] = dict(result.get(key) or {})
+    result["returning_teacher_positions"] = list(result.get("returning_teacher_positions") or [])
+    result["restore_only_positions"] = list(result.get("restore_only_positions") or [])
     return result
 
 
@@ -170,6 +174,44 @@ def optimise_exam_sessions(
         raise ValueError(f"未知请假教师: {', '.join(sorted(unknown_absent))}")
     locked_session_ids = set(map(str, locked_session_ids or ()))
 
+    # 复岗优先位只作为“高优先级候选”，不绕过教师的时间、考场和工作量约束。
+    session_index = {str(session["session_id"]): index for index, session in enumerate(sessions)}
+    teacher_ids = set(teacher_by_id)
+    returning_formal = {}
+    returning_rooms = set()
+    restore_only_formal = set()
+    restore_only_backup = set()
+    restore_only_teachers = set()
+    for position in policy["returning_teacher_positions"]:
+        session_id = str(position.get("session_id", ""))
+        room = str(position.get("room", ""))
+        teacher_id = str(position.get("teacher_id", ""))
+        if session_id not in session_index or teacher_id not in teacher_ids or not room:
+            continue
+        session = sessions[session_index[session_id]]
+        if room not in {str(value) for value, _ in session["rooms"]}:
+            continue
+        rule = limits[teacher_id]
+        if teacher_id in unavailable_teacher_ids or session_id in rule["unavailable"] or room in rule["avoid_rooms"]:
+            continue
+        role = str(position.get("role", ""))
+        key = (teacher_id, session_index[session_id], room)
+        if "备选" not in role:
+            returning_formal[key] = role
+            returning_rooms.add((session_index[session_id], room))
+    for position in policy["restore_only_positions"]:
+        session_id = str(position.get("session_id", ""))
+        room = str(position.get("room", ""))
+        teacher_id = str(position.get("teacher_id", ""))
+        key = (teacher_id, session_index.get(session_id), room)
+        if key[1] is None or teacher_id not in teacher_ids or not room:
+            continue
+        restore_only_teachers.add(teacher_id)
+        if "备选" in str(position.get("role", "")):
+            restore_only_backup.add(key)
+        else:
+            restore_only_formal.add(key)
+
     sessions_do_not_overlap = not any(
         periods_overlap(sessions[left], sessions[right])
         for left in range(len(sessions)) for right in range(left + 1, len(sessions))
@@ -214,7 +256,7 @@ def optimise_exam_sessions(
                     counts[teacher[0]] += 1
                 assignments[room] = current
             results[str(session["session_id"])] = {"session": session, "assignments": assignments, "backups": {}}
-        _assign_backups(results, sessions, teachers, limits, policy["backup_count"])
+        _assign_backups(results, sessions, teachers, limits, policy["backup_count"], returning_teacher_positions=policy["returning_teacher_positions"])
         for result in results.values():
             result["report"] = _session_report(result, policy["backup_count"])
         metrics = schedule_metrics(results, teachers, limits)
@@ -251,6 +293,7 @@ def optimise_exam_sessions(
                     teacher_id in unavailable_teacher_ids
                     or str(session["session_id"]) in limits[teacher_id]["unavailable"]
                     or room in limits[teacher_id]["avoid_rooms"]
+                    or (teacher_id in restore_only_teachers and (teacher_id, s, room) not in restore_only_formal)
                 )
                 if blocked:
                     model.add(formal[teacher_id, s, room] == 0)
@@ -342,6 +385,9 @@ def optimise_exam_sessions(
             key = (teacher_id, s, room)
             if key not in formal:
                 continue
+            # 复岗原考场允许替换掉请假后的临时人员，避免旧稳定性约束压过复岗优先级。
+            if (s, room) in returning_rooms:
+                continue
             session_id = str(sessions[s]["session_id"])
             rule = limits[teacher_id]
             if teacher_id in unavailable_teacher_ids or session_id in rule["unavailable"] or room in rule["avoid_rooms"]:
@@ -416,7 +462,12 @@ def optimise_exam_sessions(
         + sum(gender_mix) * policy["gender_weight"]
         + sum(department_mix) * policy["department_weight"]
     )
-    model.minimize(shortage_cost + fairness_cost + consecutive_cost - soft_reward)
+    returning_reward = sum(
+        formal[teacher_id, s, room] * 1_000_000
+        + (first[teacher_id, s, room] * 100_000 if "第一" in role else 0)
+        for (teacher_id, s, room), role in returning_formal.items()
+    )
+    model.minimize(shortage_cost + fairness_cost + consecutive_cost - soft_reward - returning_reward)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = policy["time_limit_seconds"]
@@ -446,6 +497,8 @@ def optimise_exam_sessions(
         previous_results=previous_results,
         unavailable_teacher_ids=unavailable_teacher_ids,
         consecutive_gap_minutes=policy["consecutive_gap_minutes"],
+        returning_teacher_positions=policy["returning_teacher_positions"],
+        restore_only_positions=policy["restore_only_positions"],
     )
     for result in results.values():
         result["report"] = _session_report(result, backup_need)
@@ -462,6 +515,8 @@ def optimise_exam_sessions(
 def _assign_backups(
     results, sessions, teachers, limits, backup_count, previous_results=None,
     unavailable_teacher_ids=None, consecutive_gap_minutes=120,
+    returning_teacher_positions=None,
+    restore_only_positions=None,
 ):
     """正式安排确定后分配备选；分步求解能让 135 人样例稳定在 20 秒内完成。"""
     unavailable_teacher_ids = set(unavailable_teacher_ids or ())
@@ -479,8 +534,24 @@ def _assign_backups(
         for room, items in result.get("backups", {}).items():
             previous_lookup[str(session_id), str(room)] = [teacher[0] for teacher in items]
 
+    returning_lookup = {}
+    for position in returning_teacher_positions or ():
+        if "备选" not in str(position.get("role", "")):
+            continue
+        returning_lookup[str(position.get("session_id", "")), str(position.get("room", ""))] = str(position.get("teacher_id", ""))
+    restore_only_keys = set()
+    restore_only_teachers = set()
+    for position in restore_only_positions or ():
+        if "备选" not in str(position.get("role", "")):
+            continue
+        teacher_id = str(position.get("teacher_id", ""))
+        restore_only_teachers.add(teacher_id)
+        restore_only_keys.add((teacher_id, str(position.get("session_id", "")), str(position.get("room", ""))))
+
     def unavailable_for_task(teacher_id, session, room):
         if teacher_id in unavailable_teacher_ids:
+            return True
+        if teacher_id in restore_only_teachers and (teacher_id, str(session["session_id"]), str(room)) not in restore_only_keys:
             return True
         rule = limits[teacher_id]
         if str(session["session_id"]) in rule["unavailable"] or room in rule["avoid_rooms"]:
@@ -536,9 +607,11 @@ def _assign_backups(
             genders = {teacher[3] for teacher in current}
             departments = {teacher[4] for teacher in current}
             preferred = previous_lookup.get((session_id, room), [])
+            returning_teacher = returning_lookup.get((session_id, room))
 
             def rank(teacher):
                 return (
+                    teacher[0] != returning_teacher,
                     teacher[0] not in preferred,
                     preferred.index(teacher[0]) if teacher[0] in preferred else 999,
                     formal_counts[teacher[0]],

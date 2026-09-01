@@ -1,9 +1,9 @@
 const $ = (id) => document.getElementById(id);
 let datasetId = '', scheduleId = localStorage.getItem('smartExamScheduleId') || '', result = JSON.parse(localStorage.getItem('smartExamResult') || '{}');
-let role = '', teacherId = '', workloadItems = JSON.parse(localStorage.getItem('smartExamWorkload') || '[]');
+let role = '', teacherId = '', teacherName = '', workloadItems = JSON.parse(localStorage.getItem('smartExamWorkload') || '[]');
 let aiConversation = JSON.parse(localStorage.getItem('smartExamAiConversation') || '[]');
 let dispatchHistory = JSON.parse(localStorage.getItem('smartExamDispatchHistory') || '[]');
-function pageLabel(page) { return page === 'results' && role === 'teacher' ? '我的监考安排' : ({workbench:'排考工作台', results:'排考结果', timeline:'我的排考时间轴', workload:'查看教师工作量', dispatch:'智能调度', exports:'数据导出 / 分组导出'}[page] || '排考工作台'); }
+function pageLabel(page) { return page === 'results' && role === 'teacher' ? '我的监考安排' : ({workbench:'排考工作台', results:'排考结果', timeline:'我的排考时间轴', workload:'查看教师工作量', dispatch:'智能调度', dispatchRequests:'调度请求中心', exports:'数据导出 / 分组导出'}[page] || '排考工作台'); }
 function updatePageHeading(page) { const label = pageLabel(page); $('pageBreadcrumb').textContent = `智能排考系统 / ${label}`; $('pageTitle').textContent = label; }
 const showPage = (page) => {
   document.querySelectorAll('.page-section').forEach(x => x.classList.remove('active'));
@@ -22,7 +22,7 @@ async function login(event) {
     const response = await fetch('/api/v1/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:$('loginUsername').value, password:$('loginPassword').value})});
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || '登录失败');
-    role = data.role; teacherId = data.teacher_id || '';
+    role = data.role; teacherId = data.teacher_id || ''; teacherName = data.teacher_name || '';
     if (role === 'admin') {
       if (data.schedule_id !== scheduleId) {
         scheduleId = data.schedule_id || '';
@@ -35,6 +35,9 @@ async function login(event) {
     }
     $('loginView').style.display = 'none'; $('systemStatus').textContent = role === 'admin' ? '管理员已登录' : `监考老师：${data.teacher_name}`;
     document.body.classList.toggle('teacher-mode', role === 'teacher');
+    if ($('dispatchHistoryButton')) $('dispatchHistoryButton').style.display = role === 'teacher' ? 'none' : '';
+    const dispatchNav = document.querySelector('[data-page="dispatch"]');
+    if (dispatchNav) dispatchNav.style.display = '';
     document.querySelectorAll('.admin-only').forEach(x => x.style.display = role === 'admin' ? '' : 'none');
     document.querySelectorAll('.teacher-only').forEach(x => x.style.display = role === 'teacher' ? '' : 'none');
     $('resultsNavLabel').textContent = role === 'teacher' ? '我的监考安排' : '排考结果';
@@ -52,8 +55,9 @@ async function login(event) {
         localStorage.setItem('smartExamResult', JSON.stringify(result));
       }
     }
-    if (role === 'teacher') { document.querySelectorAll('.teacher-filter,.timeline-filter').forEach(x => x.style.display = 'none'); }
-    if (Object.keys(result).length) { renderSessionOptions(); renderTeacherOptions(); render(); renderTimeline(); }
+    if (role === 'teacher') { document.querySelectorAll('.teacher-filter,.timeline-filter').forEach(x => x.style.display = 'none'); ensureTeacherAssistant(); }
+    if (role === 'teacher') { renderSessionOptions(); renderTeacherOptions(); render(); renderTimeline(); renderTeacherAssistant(); }
+    else if (Object.keys(result).length) { renderSessionOptions(); renderTeacherOptions(); render(); renderTimeline(); }
     showPage(role === 'admin' ? 'workbench' : 'results');
   } catch (e) { $('loginMessage').textContent = e.message.includes('Failed to fetch') ? '无法连接服务器，请确认 PowerShell 中的网页服务仍在运行' : e.message; }
 }
@@ -175,7 +179,7 @@ async function parseAiPolicy() {
     const retryButton = document.createElement('button');
     retryButton.className = 'outline-button'; retryButton.textContent = '重新描述';
     retryButton.addEventListener('click', () => {
-      actions.querySelectorAll('button').forEach(button => button.disabled = true);
+      actions.remove();
       addAiChatMessage('好的，我们重新描述这次排考要求。您可以直接告诉我教师、日期、考试场次、备选监考人数或其他限制条件，我会重新为您整理方案。', 'assistant');
       $('aiInstruction').placeholder = '请重新描述排考要求，例如：每个考场安排1名备选监考...';
       $('aiInstruction').focus();
@@ -197,6 +201,8 @@ async function solveWithAiPolicy() {
   button.dataset.originalText = button.textContent;
   button.textContent = '正在生成…';
   $('aiMessage').textContent = '正在校验规则并生成排考方案，请稍候…';
+  const progressMessage = addAiChatMessage('正在生成排考方案，请稍候…', 'assistant');
+  progressMessage.classList.add('ai-thinking');
   try {
     const validation = await (await api('/api/v1/policies/validate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({dataset_id:datasetId, policy:aiPolicy})})).json();
     if (!validation.valid) throw new Error(validation.errors.join('；'));
@@ -204,13 +210,13 @@ async function solveWithAiPolicy() {
     const solved = await (await api('/api/v1/schedules/solve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({dataset_id:datasetId, policy:solvePolicy})})).json();
     scheduleId = solved.schedule_id; result = solved.optimised; workloadItems = solved.workload || [];
     recordDispatchHistory(solved, aiConversation.at(-1)?.content || '未记录要求');
-    localStorage.setItem('smartExamScheduleId', scheduleId); localStorage.setItem('smartExamResult', JSON.stringify(result)); localStorage.setItem('smartExamWorkload', JSON.stringify(workloadItems));
+    localStorage.setItem('smartExamScheduleId', scheduleId); localStorage.setItem('smartExamResult', JSON.stringify(result)); localStorage.setItem('smartExamWorkload', JSON.stringify(workloadItems)); localStorage.setItem('smartExamSyncAt', String(Date.now()));
     renderExportSessions(); $('sessionSelect').innerHTML = Object.values(result).map(x => `<option value="${x.session.session_id}">${x.session.session_id}｜${x.session.period_text || x.session.start}</option>`).join(''); render(); renderTeacherOptions(); loadWorkload(); showPage('results');
     renderDispatchTask(solved);
     addAiChatMessage(`排考完成：共${Object.keys(result).length}个场次，人员缺口${Object.values(result).reduce((n, x) => n + (x.report.shortage || 0), 0)}人。详细结果已同步到右侧任务卡。`, 'assistant');
     $('aiMessage').textContent = 'AI 排考完成'; $('systemStatus').textContent = '排考完成';
   } catch (e) { $('aiMessage').textContent = e.message; }
-  finally { button.disabled = false; button.textContent = button.dataset.originalText || '确认并开始排考'; }
+  finally { progressMessage.remove(); button.disabled = false; button.textContent = button.dataset.originalText || '确认并开始排考'; }
 }
 async function previewAiReplan(plan, teacherPreview, instruction) {
   try {
@@ -262,6 +268,90 @@ function renderDispatchTask(solved) {
   $('dispatchTaskStatus').classList.toggle('task-warning', Boolean(shortage));
   $('dispatchTaskSummary').innerHTML = `<div class="dispatch-task-result"><div class="dispatch-task-result-head"><strong>本次排考任务</strong><span>${new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'})}</span></div><div class="dispatch-task-kpis"><div><small>考试场次</small><strong>${items.length}</strong></div><div><small>考场数量</small><strong>${rooms}</strong></div><div class="${shortage ? 'warning' : ''}"><small>人员缺口</small><strong>${shortage} 人</strong></div><div><small>备选监考</small><strong>${backup} 人</strong></div></div><div class="dispatch-task-detail"><p><span>执行状态</span><b>${shortage ? '已完成，但存在人员缺口' : '已完成，规则校验通过'}</b></p><p><span>公平性优化</span><b>${comparison.fairness || comparison.fairness_change || '已纳入均衡分配'}</b></p><p><span>下一步</span><b>前往“排考结果”查看人员、考场和时间轴</b></p></div></div>`;
 }
+function ensureDispatchRequests() {
+  if ($('dispatchRequests')) return;
+  $('dispatch').insertAdjacentHTML('beforebegin', '<section id="dispatchRequests" class="panel page-section" data-page-section="dispatchRequests"><div class="panel-title"><h2>调度请求中心</h2><div class="dispatch-title-actions"><button id="dispatchRequestBell" class="outline-button dispatch-request-bell" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19h16M6 19v-7a6 6 0 0 1 12 0v7M9 19a3 3 0 0 0 6 0"/></svg>教师申请 <b id="dispatchRequestBadge">0</b></button><span class="tag">集中处理教师申请</span></div></div><div class="dispatch-request-dashboard"><div class="dispatch-request-center"><div class="dispatch-rule-heading"><div><h3>调度请求中心</h3><small>查看申请内容、影响场次并完成审核</small></div><div class="dispatch-request-tools"><button id="dispatchRequestRefresh" class="outline-button" type="button">↻ 刷新</button><button id="dispatchRequestFilterButton" class="outline-button" type="button">⌕ 筛选</button></div></div><div id="dispatchRequestFilters" class="dispatch-request-filters" hidden><select id="dispatchRequestFilter"><option value="all">全部状态</option><option value="pending">待审核</option><option value="approved">已同意</option><option value="replan">已完成</option><option value="rejected">已驳回</option></select><select id="dispatchRequestSort"><option value="latest">最新申请</option><option value="oldest">最早申请</option></select></div><div class="dispatch-request-kpis"><span><b id="dispatchCenterPending">0</b><small>待审核</small></span><span><b id="dispatchCenterTotal">0</b><small>全部申请</small></span><span><b id="dispatchCenterReplan">0</b><small>已完成</small></span></div><div id="dispatchRequestList" class="dispatch-request-list"></div></div><div class="dispatch-request-guide"><h3>处理流程</h3><p>教师提交申请后，先在这里查看详情；同意申请后，AI 会自动完成重新排考并同步结果。</p><div><i>1</i>点击顶部教师申请通知</div><div><i>2</i>在右侧抽屉审核</div><div><i>3</i>AI 自动完成调度</div></div></div></section>');
+  document.body.insertAdjacentHTML('beforeend', '<div id="dispatchRequestBackdrop" class="dispatch-request-backdrop" hidden></div><aside id="dispatchRequestDrawer" class="dispatch-request-drawer" aria-label="教师调度申请" aria-hidden="true"><div class="dispatch-drawer-heading"><div><h2>教师调度申请</h2><span id="dispatchDrawerStatus" class="tag">暂无待审核</span></div><button id="dispatchRequestClose" class="dispatch-drawer-close" type="button" aria-label="关闭申请抽屉">×</button></div><div id="dispatchDrawerList" class="dispatch-drawer-list"></div></aside>');
+  const openDrawer = () => { for (let i = 0; i < localStorage.length; i++) { const key = localStorage.key(i); if (!key?.startsWith('teacherRequests_')) continue; const requests = JSON.parse(localStorage.getItem(key) || '[]'); let changed = false; requests.forEach(request => { if ((!request.status || request.status.includes('待管理员审核')) && !request.read) { request.read = true; changed = true; } }); if (changed) localStorage.setItem(key, JSON.stringify(requests)); } renderDispatchRequests(); $('dispatchRequestDrawer').classList.add('open'); $('dispatchRequestDrawer').setAttribute('aria-hidden', 'false'); $('dispatchRequestBackdrop').hidden = false; };
+  const closeDrawer = () => { $('dispatchRequestDrawer').classList.remove('open'); $('dispatchRequestDrawer').setAttribute('aria-hidden', 'true'); $('dispatchRequestBackdrop').hidden = true; };
+  $('dispatchRequestBell').addEventListener('click', openDrawer); $('dispatchRequestRefresh').addEventListener('click', renderDispatchRequests); $('dispatchRequestFilterButton').addEventListener('click', () => { $('dispatchRequestFilters').hidden = !$('dispatchRequestFilters').hidden; }); $('dispatchRequestFilter').addEventListener('change', renderDispatchRequests); $('dispatchRequestSort').addEventListener('change', renderDispatchRequests); $('dispatchRequestClose').addEventListener('click', closeDrawer); $('dispatchRequestBackdrop').addEventListener('click', closeDrawer);
+  $('dispatchDrawerList').addEventListener('click', event => {
+    const button = event.target.closest('button[data-request-action]');
+    if (!button) return;
+    const item = button.closest('[data-request-key]') || button.closest('.dispatch-request-actions')?.previousElementSibling;
+    if (!item) return;
+    const [key, index] = item.dataset.requestKey.split('|');
+    const requests = JSON.parse(localStorage.getItem(key) || '[]'), request = requests[Number(index)];
+    if (!request) return;
+    if (button.dataset.requestAction === 'approve') return approveTeacherRequest(key, Number(index));
+    request.status = '已驳回'; localStorage.setItem(key, JSON.stringify(requests)); renderDispatchRequests();
+  });
+  renderDispatchRequests();
+}
+async function approveTeacherRequest(key, index) {
+  const requests = JSON.parse(localStorage.getItem(key) || '[]'), request = requests[index];
+  if (!request || !scheduleId) return;
+  request.status = 'AI正在重新排考'; request.read = true; localStorage.setItem(key, JSON.stringify(requests)); renderDispatchRequests();
+  const teacher = request.teacher_id || key.replace('teacherRequests_', ''), sessionIds = (request.affected_sessions || []).map(x => x.session_id).filter(Boolean);
+  if (!sessionIds.length) Object.values(result).forEach(item => { const assigned = Object.values(item.assignments || {}).some(list => list.some(x => x.teacher_id === teacher)); const backup = Object.values(item.backups || {}).some(list => list.some(x => x.teacher_id === teacher)); if (assigned || backup) sessionIds.push(item.session.session_id); });
+  if (!sessionIds.length) { request.status = '已同意，待人工确认场次'; localStorage.setItem(key, JSON.stringify(requests)); renderDispatchRequests(); return; }
+  try {
+    const unavailableBySession = Object.fromEntries(sessionIds.map(sessionId => [sessionId, [teacher]]));
+    const response = await api('/api/v1/schedules/replan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({schedule_id:scheduleId, unavailable_teacher_ids:[], unavailable_by_session:unavailableBySession, affected_session_ids:sessionIds, policy:aiPolicy || {}})});
+    const replanned = await response.json();
+    scheduleId = replanned.schedule_id; result = replanned.optimised; workloadItems = replanned.workload || [];
+    localStorage.setItem('smartExamScheduleId', scheduleId); localStorage.setItem('smartExamResult', JSON.stringify(result)); localStorage.setItem('smartExamWorkload', JSON.stringify(workloadItems));
+    request.status = '已完成，排考结果已同步'; localStorage.setItem(key, JSON.stringify(requests)); renderExportSessions(); renderSessionOptions(); renderTeacherOptions(); render(); loadWorkload(); renderDispatchRequests();
+  } catch (error) { request.status = `处理失败：${error.message}`; localStorage.setItem(key, JSON.stringify(requests)); renderDispatchRequests(); }
+}
+function renderDispatchRequests() {
+  const host = $('dispatchRequestList'), drawer = $('dispatchDrawerList');
+  if (!host || !drawer) return;
+  const openCenterKeys = new Set([...host.querySelectorAll('.dispatch-request-item[open]')].map(item => item.dataset.requestKey).filter(Boolean));
+  const openDrawerKeys = new Set([...drawer.querySelectorAll('.dispatch-request-item[open]')].map(item => item.dataset.requestKey).filter(Boolean));
+  const requests = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (!key?.startsWith('teacherRequests_')) continue;
+    JSON.parse(localStorage.getItem(key) || '[]').forEach((request, index) => requests.push({key, index, ...request}));
+  }
+  requests.forEach(request => {
+    request.teacher_id ||= request.key.replace('teacherRequests_', '');
+    if (request.status === '已同意，待重新排考') request.status = '已调整';
+    const hasRecordedSessions = request.affected_sessions?.length;
+    if (!hasRecordedSessions) {
+      request.affected_sessions = [];
+      for (const item of Object.values(result)) {
+        for (const [room, teachers] of Object.entries(item.assignments || {})) {
+          const teacher = teachers.find(x => x.teacher_id === request.teacher_id);
+          if (!teacher) continue;
+          request.teacher_name ||= teacher.name; request.affected_sessions.push({session_id:item.session.session_id, date:new Date(item.session.start).toLocaleDateString('zh-CN'), period:item.session.period_text || '待确认', room, role:teacher.role || '正式监考'}); break;
+        }
+        for (const [room, teachers] of Object.entries(item.backups || {})) {
+          const teacher = teachers.find(x => x.teacher_id === request.teacher_id);
+          if (!teacher) continue;
+          request.teacher_name ||= teacher.name; request.affected_sessions.push({session_id:item.session.session_id, date:new Date(item.session.start).toLocaleDateString('zh-CN'), period:item.session.period_text || '待确认', room, role:'备选监考'}); break;
+        }
+      }
+    }
+    request.affected_sessions = request.affected_sessions.filter((x, index, list) => index === list.findIndex(y => `${y.date}|${y.period}|${y.room}` === `${x.date}|${x.period}|${x.room}`));
+    const first = request.affected_sessions[0]; request.change_date ||= first?.date || ''; request.change_period ||= first?.period || ''; request.original_room ||= first?.room || '';
+  });
+  const pending = requests.filter(x => !x.status || x.status.includes('待管理员审核')), unread = pending.filter(x => !x.read);
+  $('dispatchRequestBadge').textContent = unread.length; $('dispatchRequestBadge').hidden = !unread.length; $('dispatchCenterPending').textContent = pending.length; $('dispatchCenterTotal').textContent = requests.length; $('dispatchCenterReplan').textContent = requests.filter(x => x.status?.startsWith('已完成') || x.status === '已调整').length; $('dispatchDrawerStatus').textContent = pending.length ? `待审核 ${pending.length}` : '暂无待审核';
+  const selected = $('dispatchRequestFilter')?.value || 'all', sort = $('dispatchRequestSort')?.value || 'latest';
+  const matches = request => selected === 'all' || (selected === 'pending' && (!request.status || request.status.includes('待管理员审核'))) || (selected === 'approved' && request.status === '已同意') || (selected === 'replan' && (request.status?.startsWith('已完成') || request.status === '已调整')) || (selected === 'rejected' && request.status === '已驳回');
+  const visible = requests.filter(matches).sort((a, b) => sort === 'oldest' ? a.time.localeCompare(b.time) : b.time.localeCompare(a.time));
+  const card = request => { const sessions = request.affected_sessions || [], complete = /已完成|已同意|已恢复|已调整/.test(request.status || ''), rejected = /已驳回/.test(request.status || ''); return `<details class="dispatch-request-item${complete ? ' is-complete' : ''}${rejected ? ' is-rejected' : ''}" data-request-key="${request.key}|${request.index}"><summary><div class="dispatch-request-item-head"><span class="dispatch-request-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6zM14 3v4h4M9 12h6M9 16h4"/></svg></span><strong>${request.teacher_name || request.teacher_id || '教师'}（${request.teacher_id || '工号待补充'}）</strong><em class="dispatch-request-status ${request.status ? 'done' : 'pending'}">${request.status || '待审核'}</em></div><p>${request.text}</p><div class="dispatch-request-meta"><span>涉及 ${sessions.length || 1} 场考试</span><span>请求时间：${request.time}</span></div></summary><div class="dispatch-request-impact"><div class="dispatch-request-impact-title">申请影响：${sessions.length || 1} 场考试 · ${new Set(sessions.map(x => x.date)).size || 1} 个日期 · ${new Set(sessions.map(x => x.room)).size || 1} 个考场</div>${sessions.map(x => `<div class="dispatch-session-row"><span>${x.date}</span><span>${x.period}</span><span>${x.room}</span><span>${x.role}</span></div>`).join('') || '<div class="dispatch-session-row">暂无对应排考明细</div>'}</div></details>`; };
+  host.innerHTML = visible.slice(0, 4).map(card).join('') || '<div class="dispatch-task-empty">暂无符合条件的申请</div>';
+  drawer.innerHTML = requests.filter(request => !request.status || request.status.includes('待管理员审核')).map(request => `${card(request)}<div class="dispatch-request-actions"><button class="outline-button" data-request-action="reject" type="button">驳回申请</button><button class="primary-button" data-request-action="approve" type="button">同意申请</button></div>`).join('') || '<div class="dispatch-task-empty">暂无未审核申请</div>';
+  host.querySelectorAll('.dispatch-request-item[data-request-key]').forEach(item => { item.open = openCenterKeys.has(item.dataset.requestKey); });
+  drawer.querySelectorAll('.dispatch-request-item[data-request-key]').forEach(item => { item.open = openDrawerKeys.has(item.dataset.requestKey); });
+}
+ensureDispatchRequests();
+window.addEventListener('storage', event => { if (event.key?.startsWith('teacherRequests_')) { renderDispatchRequests(); if (role === 'teacher') renderTeacherAssistant(); } if (['smartExamScheduleId', 'smartExamResult', 'smartExamWorkload', 'smartExamSyncAt'].includes(event.key)) { if (role === 'teacher') refreshTeacherViews(); if (role === 'admin' && event.key === 'smartExamScheduleId') { scheduleId = localStorage.getItem('smartExamScheduleId') || scheduleId; result = JSON.parse(localStorage.getItem('smartExamResult') || '{}'); workloadItems = JSON.parse(localStorage.getItem('smartExamWorkload') || '[]'); renderSessionOptions(); renderTeacherOptions(); render(); loadWorkload(); } } });
+setInterval(() => { if (role === 'admin') renderDispatchRequests(); }, 2000);
+setInterval(refreshTeacherViews, 3000);
 if ($('aiParseButton')) { $('aiParseButton').textContent = '➤'; $('aiParseButton').setAttribute('aria-label', '发送消息'); $('aiParseButton').title = '发送消息'; }
 $('aiParseButton')?.addEventListener('click', parseAiPolicy);
 $('aiInstruction')?.addEventListener('keydown', event => {
@@ -283,6 +373,118 @@ function renderTeacherOptions() { const teachers = teacherList().filter(t => rol
 function renderTimeline() { const teacherId = $('timelineTeacherSelect').value; if (!teacherId) { $('timelineBody').innerHTML = '<div class="timeline-empty">请选择监考老师查看个人排考时间表</div>'; return; } const tasks = []; Object.values(result).forEach(item => { Object.entries(item.assignments).forEach(([room, teachers]) => teachers.forEach((t, i) => { if (t.teacher_id === teacherId) tasks.push({item, room, role: i ? '正式监考' : '第一监考', color: i ? 'blue' : 'green'}); })); Object.entries(item.backups || {}).forEach(([room, teachers]) => teachers.forEach(t => { if (t.teacher_id === teacherId) tasks.push({item, room, role:'备选监考', color:'orange'}); })); }); tasks.sort((a,b) => new Date(a.item.session.start) - new Date(b.item.session.start)); $('timelineBody').innerHTML = tasks.map(x => `<div class="timeline-card ${x.color}"><div class="timeline-time">${x.item.session.period_text || x.item.session.start}</div><div class="timeline-main"><strong>${x.item.session.session_id} · ${x.room}</strong><span>${x.item.session.title || '考试场次'} · ${x.role}</span></div></div>`).join('') || '<div class="timeline-empty">该教师暂无监考安排</div>'; }
 function renderTimeline() { const teacherId = $('timelineTeacherSelect').value; if (!teacherId) { $('timelineBody').innerHTML = '<div class="timeline-empty">请选择监考老师查看个人排考时间表</div>'; return; } const tasks = []; Object.values(result).forEach(item => { Object.entries(item.assignments).forEach(([room, teachers]) => teachers.forEach((t, i) => { if (t.teacher_id === teacherId) tasks.push({item, room, role: i ? '正式监考' : '第一监考', color: i ? 'blue' : 'green'}); })); Object.entries(item.backups || {}).forEach(([room, teachers]) => teachers.forEach(t => { if (t.teacher_id === teacherId) tasks.push({item, room, role:'备选监考', color:'orange'}); })); }); tasks.sort((a,b) => new Date(a.item.session.start) - new Date(b.item.session.start)); if (!tasks.length) { $('timelineBody').innerHTML = '<div class="timeline-empty">该教师暂无监考安排</div>'; return; } const dates = new Map(); tasks.forEach(task => { const start = new Date(task.item.session.start), end = new Date(task.item.session.end), date = start.toLocaleDateString('zh-CN'), startHour = start.getHours() + start.getMinutes() / 60, endHour = end.getHours() + end.getMinutes() / 60; if (!dates.has(date)) dates.set(date, []); dates.get(date).push({...task, startHour, endHour}); }); const times = Array.from({length: 11}, (_, i) => 8 + i); $('timelineBody').innerHTML = `<div class="timeline-grid"><div class="timeline-header"><strong>日期</strong><div class="time-scale">${times.map(h => `<span>${String(h).padStart(2,'0')}:00</span>`).join('')}</div></div>${[...dates].map(([date, dateTasks]) => `<div class="timeline-row"><div class="timeline-date">${date}</div><div class="timeline-track">${dateTasks.map(x => { const left = Math.max(0, Math.min(100, (x.startHour - 8) / 10 * 100)), width = Math.max(12, Math.min(100 - left, (x.endHour - x.startHour) / 10 * 100)), session = x.startHour < 12 ? '上午场' : '下午场', startText = `${String(Math.floor(x.startHour)).padStart(2,'0')}:${String(Math.round((x.startHour % 1) * 60)).padStart(2,'0')}`, endText = `${String(Math.floor(x.endHour)).padStart(2,'0')}:${String(Math.round((x.endHour % 1) * 60)).padStart(2,'0')}`; return `<div class="timeline-task ${x.color}" style="left:${left}%;width:${width}%"><strong>${session} · ${x.room}</strong><span>${x.item.session.title || '考试科目'}</span><small>${startText}-${endText} · ${x.role}</small></div>`; }).join('')}</div></div>`).join('')}</div>`; }
 function teacherTasks() { const tasks = []; Object.values(result).forEach(item => { Object.entries(item.assignments || {}).forEach(([room, teachers]) => teachers.forEach((teacher, index) => { if (!teacherId || teacher.teacher_id === teacherId) tasks.push({item, room, teacher, role: index ? '监考人员' : '第一监考', color: index ? 'formal' : 'first'}); })); Object.entries(item.backups || {}).forEach(([room, teachers]) => teachers.forEach(teacher => { if (!teacherId || teacher.teacher_id === teacherId) tasks.push({item, room, teacher, role: '备选监考', color: 'backup'}); })); }); return tasks.sort((a, b) => new Date(a.item.session.start) - new Date(b.item.session.start)); }
+function teacherKnowledgeAnswer(text, tasks) {
+  const normalized = text.replace(/[？?！!。，“”、]/g, '');
+  const next = tasks[0];
+  const formal = tasks.filter(task => task.color !== 'backup');
+  const backups = tasks.filter(task => task.color === 'backup');
+  const requests = JSON.parse(localStorage.getItem(`teacherRequests_${teacherId}`) || '[]');
+  const latestRequest = requests[0];
+  if (/帮助|能做什么|怎么用|功能|指引|知识库/.test(normalized)) return '我可以帮您：查询下一场或全部监考、查看日期/时间/考场/科目/角色、区分正式与备选任务、统计工作量、查看调度申请进度、提交请假或换班申请、恢复可用状态，以及说明时间轴和安排同步情况。您可以直接问“我下一场在哪”“我有几场备选监考”“我的申请到哪一步了”。';
+  if (/下一场|最近一场|下场|何时监考|什么时候监考/.test(normalized)) return next ? `您下一场是“${next.item.session.title || '考试科目'}”，${next.item.session.period_text || next.item.session.start}，考场：${next.room}，角色：${next.role}。` : '当前没有监考安排；如果您刚恢复可用，系统会在有人员缺口时由 AI 自动重新安排。';
+  if (/全部|所有|近期|我的监考|有哪些安排|安排列表/.test(normalized) && /监考|任务|场次/.test(normalized)) return tasks.length ? `您当前共有 ${formal.length} 场正式监考、${backups.length} 场备选待命，共 ${tasks.length} 条安排：${tasks.slice(0, 8).map((task, index) => `${index + 1}. ${task.item.session.period_text || task.item.session.start}｜${task.room}｜${task.role}`).join('；')}${tasks.length > 8 ? '；其余安排请查看“我的监考安排”或“我的排考时间轴”。' : '。'}` : '当前没有查询到您的监考安排。';
+  if (/正式|正考|正式监考/.test(normalized)) return formal.length ? `您共有 ${formal.length} 场正式监考：${formal.slice(0, 8).map(task => `${task.item.session.period_text || task.item.session.start}，${task.room}，${task.role}`).join('；')}。` : '当前没有正式监考安排。';
+  if (/备选|候补|备用|待命/.test(normalized)) return backups.length ? `您共有 ${backups.length} 场备选待命：${backups.slice(0, 8).map(task => `${task.item.session.period_text || task.item.session.start}，${task.room}`).join('；')}。` : '当前没有备选监考安排。';
+  if (/工作量|工作量统计|监考次数|几场|多少场|任务量/.test(normalized)) return `当前工作量：正式监考 ${formal.length} 场，备选待命 ${backups.length} 场，总计 ${tasks.length} 场。具体统计也可以在“查看教师工作量”页面查看。`;
+  if (/申请|请假|调度/.test(normalized) && /状态|进度|结果|审核|处理到哪/.test(normalized)) return latestRequest ? `您最近一次申请是“${latestRequest.text}”，当前状态：${latestRequest.status || '待管理员审核'}。排考老师审核后，调整结果会同步到您的监考安排。` : '您目前还没有调度申请。需要请假、换班或调整监考时，可以直接告诉我，例如“请假下午场”或“请假所有考试”。';
+  if (/申请记录|历史申请|以前申请/.test(normalized)) return requests.length ? `您共有 ${requests.length} 条调度申请，最近一条为“${latestRequest.text}”，状态：${latestRequest.status || '待管理员审核'}。` : '暂无调度申请记录。';
+  if (/时间轴|日历|按日期/.test(normalized)) return tasks.length ? '您的全部监考可以在左侧“我的排考时间轴”按日期查看，颜色会区分第一监考、普通正式监考和备选监考。' : '当前没有可显示的监考任务，时间轴会在排考结果同步后自动更新。';
+  if (/同步|刷新|没更新|不见了|看不到|数据不对/.test(normalized)) return '教师端会定时从最新排考结果同步数据。您可以先刷新页面；如果仍不一致，请告诉我具体日期、场次或考场，排考老师可在调度请求中心核对并重新同步。';
+  if (/考场|教室/.test(normalized) && next) return `您下一场考场是 ${next.room}；如果要查看其他场次，请问“我的全部监考”或“${next.item.session.period_text || next.item.session.start}在哪个考场”。`;
+  if (/科目|考试内容|考什么/.test(normalized) && next) return `您下一场考试科目是“${next.item.session.title || '考试科目'}”，时间：${next.item.session.period_text || next.item.session.start}。`;
+  if (/取消|撤回/.test(normalized) && /申请|请假|调度/.test(normalized)) return '如需撤回调度申请，请先说明要撤回哪一条申请；已完成的排考调整需要联系排考老师处理，避免影响其他监考安排。';
+  return null;
+}
+function ensureTeacherAssistant() {
+  if ($('teacherAiWorkspace')) return;
+  const root = document.createElement('div');
+  root.id = 'teacherAiWorkspace'; root.className = 'teacher-ai-workspace';
+  root.innerHTML = `<div class="teacher-ai-card"><div class="teacher-ai-heading"><span class="teacher-ai-avatar">AI</span><div><h2>监考 AI 助手</h2><p>帮您查看监考任务、统计工作量和提交调度申请</p></div><span class="tag success-tag">在线</span></div><div id="teacherAiMessages" class="teacher-ai-messages"><div class="teacher-ai-message assistant"><span class="teacher-ai-mini-avatar">AI</span><div class="teacher-ai-bubble">您好！我是您的监考助手，可以帮您查看下一场监考、近期任务和工作量，也可以提交调度申请。</div></div></div><div class="teacher-ai-composer"><input id="teacherAiInput" placeholder="请假掉所有考试，包括正式监考和备选监考"><button id="teacherAiSend" class="primary-button">➤</button></div></div><aside class="teacher-task-panel"><div class="teacher-task-heading"><h2>我的任务</h2><span class="tag">实时同步</span></div><div id="teacherTaskSummary"></div><div class="teacher-task-heading sub"><h3>调度申请</h3><span id="teacherRequestStatus" class="tag">暂无申请</span></div><div id="teacherRequestList" class="teacher-request-list"><div class="teacher-task-empty">如需调整监考，可直接告诉 AI。</div></div></aside>`;
+  $('dispatch').appendChild(root);
+  $('teacherAiSend').addEventListener('click', sendTeacherAiMessage);
+  $('teacherAiInput').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); sendTeacherAiMessage(); } });
+  renderTeacherAssistant();
+}
+function renderTeacherAssistant() {
+  const tasks = teacherTasks(), next = tasks[0], summary = $('teacherTaskSummary');
+  if (!summary) return;
+  summary.innerHTML = next ? `<div class="teacher-task-next"><small>下一场监考</small><strong>${next.item.session.title || '考试科目'}</strong><span>${next.item.session.period_text || next.item.session.start} · ${next.room}</span><b>${next.role}</b></div><div class="teacher-task-stats"><span><small>正式监考</small><strong>${tasks.filter(x => x.color !== 'backup').length}</strong></span><span><small>备选待命</small><strong>${tasks.filter(x => x.color === 'backup').length}</strong></span></div>` : '<div class="teacher-task-empty">暂无监考任务</div>';
+  const requests = JSON.parse(localStorage.getItem(`teacherRequests_${teacherId}`) || '[]');
+  const pending = requests.find(x => !x.status || x.status.includes('待管理员审核')), latest = requests[0];
+  $('teacherRequestStatus').textContent = pending ? '待管理员审核' : (latest?.status || '暂无申请');
+  $('teacherRequestList').innerHTML = requests.slice(0, 3).map(x => { const complete = /已同意|已完成|已恢复|已调整/.test(x.status || ''), rejected = /已驳回/.test(x.status || ''); return `<div class="teacher-request-item${complete ? ' is-complete' : ''}${rejected ? ' is-rejected' : ''}"><strong>${x.text}</strong><span>${x.time} · ${x.status}</span></div>`; }).join('') || '<div class="teacher-task-empty">如需调整监考，可直接告诉 AI。</div>';
+}
+let teacherRefreshBusy = false;
+async function refreshTeacherViews() {
+  const latestScheduleId = localStorage.getItem('smartExamScheduleId') || scheduleId;
+  if (role !== 'teacher' || !latestScheduleId || teacherRefreshBusy) return;
+  scheduleId = latestScheduleId;
+  teacherRefreshBusy = true;
+  try {
+    const personal = await (await api(`/api/v1/schedules/${scheduleId}/teachers/${encodeURIComponent(teacherId)}`)).json();
+    const nextResult = personal.results || {};
+    if (JSON.stringify(nextResult) !== JSON.stringify(result)) { result = nextResult; renderSessionOptions(); renderTeacherOptions(); render(); renderTimeline(); renderExportSessions(); }
+    renderTeacherAssistant();
+  } catch (_) {}
+  finally { teacherRefreshBusy = false; }
+}
+async function sendTeacherAiMessage() {
+  const input = $('teacherAiInput'), text = input?.value.trim();
+  if (!text) return;
+  const messages = $('teacherAiMessages');
+  messages.insertAdjacentHTML('beforeend', `<div class="teacher-ai-message user"><div class="teacher-ai-bubble">${text}</div><span class="teacher-ai-mini-avatar">我</span></div>`);
+  input.value = '';
+  if (/又没事|恢复|可以接着|能接着|恢复监考|到岗|复岗|恢复岗位|可以上岗|上港|回来上班/.test(text)) {
+    const thinking = document.createElement('div'); thinking.className = 'teacher-ai-message assistant teacher-ai-thinking'; thinking.innerHTML = '<span class="teacher-ai-mini-avatar">AI</span><div class="teacher-ai-bubble">正在检查受影响场次和当前人员缺口</div>'; messages.appendChild(thinking); messages.scrollTop = messages.scrollHeight;
+    const answer = await restoreTeacherAvailability(text); thinking.remove(); messages.insertAdjacentHTML('beforeend', `<div class="teacher-ai-message assistant"><span class="teacher-ai-mini-avatar">AI</span><div class="teacher-ai-bubble">${answer}</div></div>`); messages.scrollTop = messages.scrollHeight; return;
+  }
+  const tasks = teacherTasks(), next = tasks[0];
+  const isDispatchAction = /请假|监考不了|不能监考|有事|换班/.test(text) && !/状态|进度|结果|审核|处理到/.test(text);
+  const knowledgeAnswer = isDispatchAction ? null : teacherKnowledgeAnswer(text, tasks);
+  if (knowledgeAnswer) { messages.insertAdjacentHTML('beforeend', `<div class="teacher-ai-message assistant"><span class="teacher-ai-mini-avatar">AI</span><div class="teacher-ai-bubble">${knowledgeAnswer}</div></div>`); messages.scrollTop = messages.scrollHeight; return; }
+  let answer = '我可以帮您查询监考时间、考场、任务量和调度申请。请描述具体问题。';
+  if (/下一场|什么时候|最近|安排/.test(text)) answer = next ? `您下一场监考是“${next.item.session.title || '考试科目'}”，时间：${next.item.session.period_text || next.item.session.start}，考场：${next.room}，角色：${next.role}。` : '当前没有查询到您的监考安排。';
+  else if (/工作量|次数|几场|多少次/.test(text)) answer = `目前您共有 ${tasks.filter(x => x.color !== 'backup').length} 次正式监考、${tasks.filter(x => x.color === 'backup').length} 次备选待命。`;
+  else if (/有事|调整|申请|换班|不能监考/.test(text)) {
+    const key = `teacherRequests_${teacherId}`, requests = JSON.parse(localStorage.getItem(key) || '[]');
+    const selectedTasks = /多场|多个|所有|全部|日期范围/.test(text) ? tasks : (/备选|候补|备用/.test(text) ? tasks.filter(task => task.color === 'backup') : (/正式|正考/.test(text) ? tasks.filter(task => task.color !== 'backup') : (next ? [next] : [])));
+    requests.unshift({text, teacher_name:teacherName, teacher_id:teacherId, affected_sessions:selectedTasks.map(task => ({session_id:task.item.session.session_id, date:new Date(task.item.session.start).toLocaleDateString('zh-CN'), period:task.item.session.period_text || '待确认', room:task.room, role:task.role, original_teacher_id:teacherId, original_role:task.role})), time:new Date().toLocaleString('zh-CN'), status:'待管理员审核'}); localStorage.setItem(key, JSON.stringify(requests.slice(0, 10))); renderTeacherAssistant();
+    answer = '已记录您的调度申请，当前状态为“待管理员审核”。管理员确认后，调整结果会同步到您的监考安排。';
+  }
+  messages.insertAdjacentHTML('beforeend', `<div class="teacher-ai-message assistant"><span class="teacher-ai-mini-avatar">AI</span><div class="teacher-ai-bubble">${answer}</div></div>`);
+  messages.scrollTop = messages.scrollHeight;
+}
+async function restoreTeacherAvailability(requestText = '') {
+  const requests = JSON.parse(localStorage.getItem(`teacherRequests_${teacherId}`) || '[]');
+  const affectedRequests = requests.filter(request => request.status !== '已驳回' && request.affected_sessions?.length);
+  const affectedSessions = affectedRequests.flatMap(request => request.affected_sessions || []);
+  const restoreBackups = /备选|候补|备用/.test(requestText) && !/正式|正考/.test(requestText);
+  const restoreFormal = /正式|正考/.test(requestText) && !/备选|候补|备用/.test(requestText);
+  const selectedSessions = affectedSessions.filter(item => restoreBackups ? /备选|候补|备用/.test(item.role || '') : restoreFormal ? !/备选|候补|备用/.test(item.role || '') : true);
+  const sessionIds = [...new Set(selectedSessions.map(x => x.session_id).filter(Boolean))];
+  if (!sessionIds.length || !scheduleId) return '我已记录您恢复可用，但暂时找不到需要重新检查的考试场次，请联系排考老师处理。';
+  try {
+    const unavailableBySession = Object.fromEntries(sessionIds.map(sessionId => [sessionId, []]));
+    const returning_teacher_positions = selectedSessions.map(item => ({session_id:item.session_id, room:item.room, teacher_id:teacherId, role:item.role || '正式监考'})).filter((item, index, list) => item.session_id && item.room && index === list.findIndex(other => `${other.session_id}|${other.room}|${other.role}` === `${item.session_id}|${item.room}|${item.role}`));
+    const response = await api('/api/v1/schedules/replan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({schedule_id:scheduleId, unavailable_teacher_ids:[], unavailable_by_session:unavailableBySession, affected_session_ids:sessionIds, policy:{...(aiPolicy || {}), returning_teacher_positions, restore_only_positions:returning_teacher_positions}})});
+    const replanned = await response.json();
+    scheduleId = replanned.schedule_id; result = replanned.optimised; workloadItems = replanned.workload || [];
+    localStorage.setItem('smartExamScheduleId', scheduleId); localStorage.setItem('smartExamResult', JSON.stringify(result)); localStorage.setItem('smartExamWorkload', JSON.stringify(workloadItems));
+    const assigned = returning_teacher_positions.some(position => {
+      const item = result[position.session_id];
+      if (!item) return false;
+      const source = /备选/.test(position.role) ? item.backups : item.assignments;
+      return (source?.[position.room] || []).some(x => x.teacher_id === teacherId);
+    });
+    affectedRequests.forEach(request => {
+      const requestSessions = request.affected_sessions || [];
+      if (requestSessions.some(item => selectedSessions.some(selected => selected.session_id === item.session_id && selected.room === item.room && selected.role === item.role))) request.status = assigned ? `已恢复${restoreBackups ? '备选' : restoreFormal ? '正式' : '全部'}监考并重新安排` : '已恢复可用，当前无需新增任务';
+    });
+    localStorage.setItem(`teacherRequests_${teacherId}`, JSON.stringify(requests));
+    renderSessionOptions(); renderTeacherOptions(); render(); renderTimeline(); renderExportSessions(); renderTeacherAssistant();
+    return assigned ? '已恢复您的可用状态，AI 已根据当前人员缺口重新安排任务，最新监考安排已同步。' : '您已恢复可用。AI 检查后发现当前人员已经充足，暂时不再给您新增监考任务。';
+  } catch (error) { return `已记录您恢复可用，但自动调度暂未完成：${error.message}`; }
+}
 function renderTeacherHome() { const tasks = teacherTasks(), next = tasks[0], title = $('teacherNextTitle'), details = $('teacherNextDetails'); if (!next) { title.textContent = '当前暂无监考安排'; details.innerHTML = '<div class="teacher-empty">排考方案中暂未找到你的监考任务</div>'; $('teacherNextStatus').textContent = '暂无安排'; $('teacherUpcomingList').innerHTML = '<div class="teacher-empty">暂无近期监考安排</div>'; return; } const session = next.item.session, start = new Date(session.start), end = new Date(session.end), period = start.getHours() < 12 ? '上午场' : '下午场'; title.textContent = session.title || '考试科目'; $('teacherNextStatus').textContent = next.role; details.innerHTML = `<div><small>日期</small><strong>${start.toLocaleDateString('zh-CN')}</strong></div><div><small>考试时间</small><strong>${period}　${start.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}—${end.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</strong></div><div><small>考场</small><strong>${next.room}</strong></div><div><small>监考角色</small><strong>${next.role}</strong></div>`; $('teacherUpcomingList').innerHTML = tasks.map(task => { const s = new Date(task.item.session.start), e = new Date(task.item.session.end), p = s.getHours() < 12 ? '上午场' : '下午场'; return `<div class="teacher-assignment-row"><div class="assignment-date"><strong>${s.getMonth()+1}月${s.getDate()}日</strong><small>${s.toLocaleDateString('zh-CN',{weekday:'short'})}</small></div><div><strong>${p}　${task.item.session.title || '考试科目'}</strong><small>${s.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}—${e.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}　·　${task.room}</small></div><span class="role-badge ${task.color}">${task.role}</span></div>`; }).join(''); }
 function renderTimeline() { const tasks = teacherTasks(); if (!tasks.length) { $('timelineBody').innerHTML = '<div class="timeline-empty">当前登录教师暂无监考安排</div>'; return; } const dates = new Map(); tasks.forEach(task => { const start = new Date(task.item.session.start), end = new Date(task.item.session.end), date = start.toLocaleDateString('zh-CN'), startHour = start.getHours() + start.getMinutes() / 60, endHour = end.getHours() + end.getMinutes() / 60; if (!dates.has(date)) dates.set(date, []); dates.get(date).push({...task, startHour, endHour}); }); const times = Array.from({length: 11}, (_, i) => 8 + i); $('timelineBody').innerHTML = `<div class="timeline-grid"><div class="timeline-header"><strong>日期</strong><div class="time-scale">${times.map(h => `<span>${String(h).padStart(2,'0')}:00</span>`).join('')}</div></div>${[...dates].map(([date, dateTasks]) => `<div class="timeline-row"><div class="timeline-date">${date}</div><div class="timeline-track">${dateTasks.map(x => { const left = Math.max(0, Math.min(100, (x.startHour - 8) / 10 * 100)), width = Math.max(12, Math.min(100 - left, (x.endHour - x.startHour) / 10 * 100)), session = x.startHour < 12 ? '上午场' : '下午场', startText = `${String(Math.floor(x.startHour)).padStart(2,'0')}:${String(Math.round((x.startHour % 1) * 60)).padStart(2,'0')}`, endText = `${String(Math.floor(x.endHour)).padStart(2,'0')}:${String(Math.round((x.endHour % 1) * 60)).padStart(2,'0')}`; return `<div class="timeline-task ${x.color}" style="left:${left}%;width:${width}%"><strong>${session} · ${x.room}</strong><span>${x.item.session.title || '考试科目'}</span><small>${startText}-${endText} · ${x.role}</small></div>`; }).join('')}</div></div>`).join('')}</div>`; }
 function render() {

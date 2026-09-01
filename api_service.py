@@ -62,6 +62,8 @@ class PolicyModel(BaseModel):
     unavailable: dict[str, list[str]] = Field(default_factory=dict)
     avoid_rooms: dict[str, list[str]] = Field(default_factory=dict)
     allow_consecutive: dict[str, bool] = Field(default_factory=dict)
+    returning_teacher_positions: list[dict] = Field(default_factory=list)
+    restore_only_positions: list[dict] = Field(default_factory=list)
 
 
 class DatasetRequest(BaseModel):
